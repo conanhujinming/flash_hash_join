@@ -9,79 +9,85 @@
 #include <functional>
 #include <numeric>
 
-// Pybind11 for Python interoperability
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
-// High-performance memory allocator
 #include <mimalloc.h>
-
-// High-performance hash function
 #define XXH_INLINE_ALL
 #include "xxhash.h"
-
-// For parallel loops (used in result materialization)
 #include <omp.h>
 
 namespace py = pybind11;
 
-// --- Hasher & Constants ---
 template<typename KeyType>
 struct Hasher {
     uint64_t operator()(const KeyType& key) const { return XXH3_64bits(&key, sizeof(KeyType)); }
 };
 
 constexpr size_t CHUNK_SIZE = 256;
-constexpr size_t NUM_LOCKS = 256;
+constexpr size_t NUM_LOCKS = 1024;
 
-// A cache-line aligned struct to hold thread-local counters, preventing false sharing.
 struct alignas(64) PaddedCounter {
     std::atomic<size_t> value{0};
 };
 
-
 template<typename KeyType, typename ValueType>
 struct UnchainedHashTable {
 private:
-    struct Entry {
-        uint8_t tag;
-        KeyType key;
-        ValueType value;
-    };
-
-    // Align chunks to cache line boundaries to potentially improve performance.
+    // --- Data Layout Change: From AoS to SoA (Structure of Arrays) ---
     struct alignas(64) Chunk {
         std::atomic<uint32_t> count{0};
         std::atomic<Chunk*> next{nullptr};
-        Entry entries[CHUNK_SIZE];
+        uint8_t   tags[CHUNK_SIZE];
+        KeyType   keys[CHUNK_SIZE];
+        ValueType values[CHUNK_SIZE];
     };
+    // --------------------------------------------------------------------
+
+    std::unique_ptr<char[]> memory_pool_;
+    std::atomic<size_t> pool_offset_{0};
+    size_t pool_size_bytes_{0};
 
     std::vector<std::atomic<Chunk*>> buckets_;
     std::vector<std::mutex> locks_;
     Hasher<KeyType> hasher_;
 
-    struct MiMallocDeleter { void operator()(Chunk* p) const { mi_free(p); } };
-    using ChunkPtr = std::unique_ptr<Chunk, MiMallocDeleter>;
-    std::vector<ChunkPtr> chunk_pool_;
-    std::mutex pool_mutex_;
-
+public:
     inline uint64_t get_bucket_idx(uint64_t hash) const { return hash & (buckets_.size() - 1); }
     inline uint8_t get_hash_tag(uint64_t hash) const { return (hash >> 32) & 0xFF; }
+    const std::atomic<Chunk*>* get_buckets_ptr() const { return buckets_.data(); }
+    size_t get_bucket_count() const { return buckets_.size(); }
 
-public:
     static size_t calculate_size(size_t initial_size) {
         size_t size = 1;
         while (size < initial_size) size <<= 1;
         return size;
     }
 
-    UnchainedHashTable(size_t initial_size = 1024*1024) 
+    UnchainedHashTable(size_t initial_size = 1024*1024, size_t build_size_hint = 0) 
         : buckets_(calculate_size(initial_size)), 
           locks_(NUM_LOCKS) 
-    {}
+    {
+        if (build_size_hint > 0) {
+            size_t num_chunks_needed = (size_t)(build_size_hint * 1.5) / CHUNK_SIZE;
+            if (num_chunks_needed == 0) num_chunks_needed = 1;
+            pool_size_bytes_ = num_chunks_needed * sizeof(Chunk);
+            size_t alignment = alignof(Chunk);
+            pool_size_bytes_ += alignment;
+            memory_pool_ = std::unique_ptr<char[]>((char*)mi_malloc_aligned(pool_size_bytes_, alignment));
+        }
+    }
+
+    Chunk* alloc_chunk_from_pool() {
+        size_t offset = pool_offset_.fetch_add(sizeof(Chunk), std::memory_order_relaxed);
+        if (offset + sizeof(Chunk) <= pool_size_bytes_) {
+            char* ptr = memory_pool_.get() + offset;
+            return new (ptr) Chunk();
+        }
+        return new (mi_malloc_aligned(sizeof(Chunk), alignof(Chunk))) Chunk();
+    }
     
-    // Build logic remains unchanged, it is already highly parallel.
     void insert(const KeyType& key, const ValueType& value) {
         uint64_t hash = hasher_(key);
         uint64_t bucket_idx = get_bucket_idx(hash);
@@ -91,27 +97,38 @@ public:
         Chunk* current_chunk = buckets_[bucket_idx].load(std::memory_order_acquire);
 
         if (current_chunk == nullptr) {
-            Chunk* new_chunk = (Chunk*)mi_malloc(sizeof(Chunk)); new (new_chunk) Chunk();
-            new_chunk->entries[0] = {tag, key, value};
+            Chunk* new_chunk = alloc_chunk_from_pool();
+            new_chunk->tags[0] = tag;
+            new_chunk->keys[0] = key;
+            new_chunk->values[0] = value;
             new_chunk->count.store(1, std::memory_order_release);
             buckets_[bucket_idx].store(new_chunk, std::memory_order_release);
-            std::lock_guard<std::mutex> pool_lock(pool_mutex_); chunk_pool_.emplace_back(new_chunk); return;
+            return;
         }
 
         while (true) {
             uint32_t slot = current_chunk->count.fetch_add(1, std::memory_order_acq_rel);
-            if (slot < CHUNK_SIZE) { current_chunk->entries[slot] = {tag, key, value}; return; }
+            if (slot < CHUNK_SIZE) {
+                current_chunk->tags[slot] = tag;
+                current_chunk->keys[slot] = key;
+                current_chunk->values[slot] = value;
+                return;
+            }
             current_chunk->count.fetch_sub(1, std::memory_order_release);
 
             Chunk* next_chunk = current_chunk->next.load(std::memory_order_acquire);
             if (next_chunk == nullptr) {
-                Chunk* new_chunk = (Chunk*)mi_malloc(sizeof(Chunk)); new (new_chunk) Chunk();
-                new_chunk->entries[0] = {tag, key, value};
+                Chunk* new_chunk = alloc_chunk_from_pool();
+                new_chunk->tags[0] = tag;
+                new_chunk->keys[0] = key;
+                new_chunk->values[0] = value;
                 new_chunk->count.store(1, std::memory_order_release);
                 Chunk* expected = nullptr;
                 if (current_chunk->next.compare_exchange_strong(expected, new_chunk, std::memory_order_acq_rel)) {
-                    std::lock_guard<std::mutex> pool_lock(pool_mutex_); chunk_pool_.emplace_back(new_chunk); return;
-                } else { mi_free(new_chunk); current_chunk = expected; }
+                    return;
+                } else {
+                    current_chunk = expected;
+                }
             } else { current_chunk = next_chunk; }
         }
     }
@@ -130,24 +147,25 @@ public:
         for (auto& t : threads) { t.join(); }
     }
     
-    // Original probe function for materializing results.
     void probe(const KeyType& key, std::vector<ValueType>& results) const {
         uint64_t hash = hasher_(key);
         uint64_t bucket_idx = get_bucket_idx(hash);
         uint8_t probe_tag = get_hash_tag(hash);
         Chunk* current_chunk = buckets_[bucket_idx].load(std::memory_order_acquire);
         while (current_chunk != nullptr) {
+            if (current_chunk->next.load(std::memory_order_relaxed)) {
+                __builtin_prefetch(current_chunk->next.load(std::memory_order_relaxed), 0, 0);
+            }
             uint32_t count = current_chunk->count.load(std::memory_order_acquire);
             for (uint32_t i = 0; i < count; ++i) {
-                if (current_chunk->entries[i].tag == probe_tag && current_chunk->entries[i].key == key) {
-                    results.push_back(current_chunk->entries[i].value);
+                if (current_chunk->tags[i] == probe_tag && current_chunk->keys[i] == key) {
+                    results.push_back(current_chunk->values[i]);
                 }
             }
             current_chunk = current_chunk->next.load(std::memory_order_acquire);
         }
     }
 
-    // A highly optimized probe function that only counts matches.
     size_t probe_and_count(const KeyType& key) const {
         uint64_t hash = hasher_(key);
         uint64_t bucket_idx = get_bucket_idx(hash);
@@ -156,10 +174,13 @@ public:
         
         Chunk* current_chunk = buckets_[bucket_idx].load(std::memory_order_acquire);
         while (current_chunk != nullptr) {
+            if (current_chunk->next.load(std::memory_order_relaxed)) {
+                __builtin_prefetch(current_chunk->next.load(std::memory_order_relaxed), 0, 0);
+            }
             uint32_t count = current_chunk->count.load(std::memory_order_acquire);
             for (uint32_t i = 0; i < count; ++i) {
-                if (current_chunk->entries[i].tag == probe_tag && current_chunk->entries[i].key == key) {
-                    match_count++; // Just increment a local counter, no heap allocation or vector ops.
+                if (current_chunk->tags[i] == probe_tag && current_chunk->keys[i] == key) {
+                    match_count++;
                 }
             }
             current_chunk = current_chunk->next.load(std::memory_order_acquire);
@@ -168,7 +189,6 @@ public:
     }
 };
 
-// --- Pybind11 Wrapper for Materializing Full Results ---
 py::tuple hash_join_two_pass(py::array_t<uint64_t> build_keys,
                              py::array_t<uint64_t> build_values,
                              py::array_t<uint64_t> probe_keys) {
@@ -182,14 +202,15 @@ py::tuple hash_join_two_pass(py::array_t<uint64_t> build_keys,
     size_t build_size = build_keys_buf.size;
     size_t probe_size = probe_keys_buf.size;
 
-    UnchainedHashTable<uint64_t, uint64_t> ht(build_size);
+    UnchainedHashTable<uint64_t, uint64_t> ht(build_size, build_size);
     ht.build(build_keys_ptr, build_values_ptr, build_size);
 
     size_t num_threads = std::thread::hardware_concurrency();
     std::vector<std::thread> threads;
     size_t chunk_size = (probe_size + num_threads - 1) / num_threads;
 
-    std::vector<size_t> counts(num_threads, 0);
+    std::vector<PaddedCounter> counts(num_threads);
+
     for (size_t i = 0; i < num_threads; ++i) {
         size_t start = i * chunk_size; size_t end = std::min(start + chunk_size, probe_size);
         if (start >= end) continue;
@@ -198,7 +219,7 @@ py::tuple hash_join_two_pass(py::array_t<uint64_t> build_keys,
             for (size_t j = start; j < end; ++j) {
                 local_results.clear(); ht.probe(probe_keys_ptr[j], local_results); local_count += local_results.size();
             }
-            counts[i] = local_count;
+            counts[i].value.store(local_count, std::memory_order_relaxed);
         });
     }
     for (auto& t : threads) { t.join(); }
@@ -207,7 +228,9 @@ py::tuple hash_join_two_pass(py::array_t<uint64_t> build_keys,
     size_t total_results = 0;
     std::vector<size_t> offsets(num_threads + 1, 0);
     for (size_t i = 0; i < num_threads; ++i) {
-        total_results += counts[i]; offsets[i+1] = offsets[i] + counts[i];
+        size_t count = counts[i].value.load();
+        total_results += count;
+        offsets[i+1] = offsets[i] + count;
     }
     
     py::array_t<uint64_t> result_keys(total_results);
@@ -233,7 +256,6 @@ py::tuple hash_join_two_pass(py::array_t<uint64_t> build_keys,
     return py::make_tuple(result_keys, result_values);
 }
 
-// --- Pybind11 Wrapper for Optimized Counting ---
 py::int_ hash_join_count_optimized(py::array_t<uint64_t> build_keys,
                                    py::array_t<uint64_t> build_values,
                                    py::array_t<uint64_t> probe_keys) {
@@ -247,14 +269,13 @@ py::int_ hash_join_count_optimized(py::array_t<uint64_t> build_keys,
     size_t build_size = build_keys_buf.size;
     size_t probe_size = probe_keys_buf.size;
 
-    UnchainedHashTable<uint64_t, uint64_t> ht(build_size);
+    UnchainedHashTable<uint64_t, uint64_t> ht(build_size, build_size);
     ht.build(build_keys_ptr, build_values_ptr, build_size);
 
     size_t num_threads = std::thread::hardware_concurrency();
     std::vector<std::thread> threads;
     size_t chunk_size = (probe_size + num_threads - 1) / num_threads;
     
-    // Use the cache-line-padded counters to prevent false sharing.
     std::vector<PaddedCounter> counts(num_threads);
 
     for (size_t i = 0; i < num_threads; ++i) {
@@ -263,8 +284,17 @@ py::int_ hash_join_count_optimized(py::array_t<uint64_t> build_keys,
         if (start >= end) continue;
         threads.emplace_back([&ht, &counts, i, probe_keys_ptr, start, end]() {
             size_t local_count = 0;
-            // The hot loop now calls the highly optimized counting probe.
-            for (size_t j = start; j < end; ++j) {
+            Hasher<uint64_t> hasher;
+            const auto* buckets_ptr = ht.get_buckets_ptr();
+            const size_t bucket_mask = ht.get_bucket_count() - 1;
+            constexpr size_t PREFETCH_DISTANCE = 32; 
+
+            for (size_t j = start; j < end - PREFETCH_DISTANCE; ++j) {
+                uint64_t future_hash = hasher(probe_keys_ptr[j + PREFETCH_DISTANCE]);
+                __builtin_prefetch(&buckets_ptr[future_hash & bucket_mask], 0, 0);
+                local_count += ht.probe_and_count(probe_keys_ptr[j]);
+            }
+            for (size_t j = std::max(start, end - PREFETCH_DISTANCE); j < end; ++j) {
                 local_count += ht.probe_and_count(probe_keys_ptr[j]);
             }
             counts[i].value.store(local_count, std::memory_order_relaxed);
@@ -280,10 +310,8 @@ py::int_ hash_join_count_optimized(py::array_t<uint64_t> build_keys,
     return py::int_(total_results);
 }
 
-
-// --- Pybind11 Module Definition ---
 PYBIND11_MODULE(fast_join, m) {
-    m.doc() = "A high-performance hash join with multiple execution modes"; 
+    m.doc() = "A high-performance hash join with SoA, Arena Allocator and Prefetching"; 
     
     m.def("hash_join", &hash_join_two_pass, 
           "Performs a hash join and returns the full result",
