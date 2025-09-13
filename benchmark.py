@@ -8,9 +8,9 @@ import pyarrow.parquet as pq
 
 # --- Import Modules ---
 try:
-    import fast_join
+    import flash_join
 except ImportError:
-    print("Error: Could not import 'fast_join' module.")
+    print("Error: Could not import 'flash_join' module.")
     sys.exit(1)
 try:
     import duckdb
@@ -19,7 +19,7 @@ except ImportError:
     sys.exit(1)
 
 print("Initializing custom memory system...")
-fast_join.initialize()
+flash_join.initialize()
 print("Initialization complete.")
 
 # --- (generate_data function remains the same) ---
@@ -49,33 +49,33 @@ if __name__ == "__main__":
     probe_df = pd.DataFrame({'key': probe_keys})
     print("Preparation complete.")
 
-    # --- 1. Benchmark our C++ (fast_join) ---
-    print("\n🚀 Starting benchmark for C++ (fast_join) [End-to-End]...")
+    # --- 1. Benchmark our C++ (flash_join) ---
+    print("\n🚀 Starting benchmark for C++ (flash_join) [End-to-End]...")
 
     start_time_cpp = time.perf_counter()
-    cpp_count = fast_join.hash_join_count(build_keys, build_values, probe_keys)
+    cpp_count = flash_join.hash_join_count(build_keys, build_values, probe_keys)
     end_time_cpp = time.perf_counter()
     duration_cpp = end_time_cpp - start_time_cpp
-    print(f"C++ (fast_join_count) finished in: {duration_cpp:.4f} seconds")
+    print(f"C++ (flash_join_count) finished in: {duration_cpp:.4f} seconds")
 
     start_time_cpp = time.perf_counter()
-    cpp_count = fast_join.hash_join(build_keys, build_values, probe_keys)
+    cpp_count = flash_join.hash_join(build_keys, build_values, probe_keys)
     end_time_cpp = time.perf_counter()
     duration_cpp = end_time_cpp - start_time_cpp
-    print(f"C++ (fast_join) finished in: {duration_cpp:.4f} seconds")
+    print(f"C++ (flash_join) finished in: {duration_cpp:.4f} seconds")
 
-    print("\n🚀 Starting benchmark for C++ (fast_join_scalar) [End-to-End]...")
+    print("\n🚀 Starting benchmark for C++ (flash_join_scalar) [End-to-End]...")
     start_time_cpp = time.perf_counter()
-    cpp_count = fast_join.hash_join_count_scalar(build_keys, build_values, probe_keys)
+    cpp_count = flash_join.hash_join_count_scalar(build_keys, build_values, probe_keys)
     end_time_cpp = time.perf_counter()
     duration_cpp = end_time_cpp - start_time_cpp
-    print(f"C++ (fast_join_count_scalar) finished in: {duration_cpp:.4f} seconds")
+    print(f"C++ (flash_join_count_scalar) finished in: {duration_cpp:.4f} seconds")
 
     start_time_cpp = time.perf_counter()
-    cpp_count = fast_join.hash_join_scalar(build_keys, build_values, probe_keys)
+    cpp_count = flash_join.hash_join_scalar(build_keys, build_values, probe_keys)
     end_time_cpp = time.perf_counter()
     duration_cpp = end_time_cpp - start_time_cpp
-    print(f"C++ (fast_join_scalar) finished in: {duration_cpp:.4f} seconds")
+    print(f"C++ (flash_join_scalar) finished in: {duration_cpp:.4f} seconds")
 
     build_file = 'build.parquet'
     probe_file = 'probe.parquet'
