@@ -29,22 +29,19 @@ struct Hasher {
     uint64_t operator()(const KeyType& key) const { return XXH3_64bits(&key, sizeof(KeyType)); }
 };
 
-constexpr size_t CHUNK_SIZE = 256;
-constexpr size_t NUM_LOCKS = 4096;
-
 struct alignas(64) PaddedCounter {
     std::atomic<size_t> value{0};
 };
 
-template<typename KeyType, typename ValueType>
+template<typename KeyType, typename ValueType, size_t ChunkSize = 256, size_t NumLocks = 8192>
 struct UnchainedHashTable {
 private:
     struct alignas(64) Chunk {
         std::atomic<uint32_t> count{0};
         std::atomic<Chunk*> next{nullptr};
-        uint8_t   tags[CHUNK_SIZE];
-        KeyType   keys[CHUNK_SIZE];
-        ValueType values[CHUNK_SIZE];
+        uint8_t   tags[ChunkSize];
+        KeyType   keys[ChunkSize];
+        ValueType values[ChunkSize];
     };
 
     std::unique_ptr<char[]> memory_pool_;
@@ -70,10 +67,10 @@ public:
 
     UnchainedHashTable(size_t initial_size = 1024*1024, size_t build_size_hint = 0) 
         : buckets_(calculate_size(initial_size)), 
-          locks_(NUM_LOCKS) 
+          locks_(NumLocks) 
     {
         if (build_size_hint > 0) {
-            size_t num_chunks_needed = (size_t)(build_size_hint * 1.5) / CHUNK_SIZE + 1;
+            size_t num_chunks_needed = (size_t)(build_size_hint * 1.5) / ChunkSize + 1;
             pool_size_bytes_ = num_chunks_needed * sizeof(Chunk);
             size_t alignment = alignof(Chunk);
             memory_pool_ = std::unique_ptr<char[]>((char*)mi_malloc_aligned(pool_size_bytes_, alignment));
@@ -111,7 +108,7 @@ public:
         uint64_t bucket_idx = get_bucket_idx(hash);
         uint8_t tag = get_hash_tag(hash);
 
-        std::lock_guard<std::mutex> lock(locks_[bucket_idx % NUM_LOCKS]);
+        std::lock_guard<std::mutex> lock(locks_[bucket_idx % NumLocks]);
         Chunk* current_chunk = buckets_[bucket_idx].load(std::memory_order_acquire);
 
         if (current_chunk == nullptr) {
@@ -126,7 +123,7 @@ public:
 
         while (true) {
             uint32_t slot = current_chunk->count.fetch_add(1, std::memory_order_acq_rel);
-            if (slot < CHUNK_SIZE) {
+            if (slot < ChunkSize) {
                 current_chunk->tags[slot] = tag;
                 current_chunk->keys[slot] = key;
                 current_chunk->values[slot] = value;
@@ -158,9 +155,9 @@ public:
     void build(const KeyType* keys, const ValueType* values, size_t size) {
         size_t num_threads = std::thread::hardware_concurrency();
         std::vector<std::thread> threads;
-        size_t chunk_size = (size + num_threads - 1) / num_threads;
+        size_t local_ChunkSize = (size + num_threads - 1) / num_threads;
         for (size_t i = 0; i < num_threads; ++i) {
-            size_t start = i * chunk_size; size_t end = std::min(start + chunk_size, size);
+            size_t start = i * local_ChunkSize; size_t end = std::min(start + local_ChunkSize, size);
             if (start >= end) continue;
             threads.emplace_back([this, keys, values, start, end]() {
                 for (size_t j = start; j < end; ++j) { this->insert(keys[j], values[j]); }
@@ -178,7 +175,7 @@ public:
             if (current_chunk->next.load(std::memory_order_relaxed)) {
                 __builtin_prefetch(current_chunk->next.load(std::memory_order_relaxed), 0, 0);
             }
-            uint32_t count = std::min((uint32_t)CHUNK_SIZE, current_chunk->count.load(std::memory_order_acquire));
+            uint32_t count = std::min((uint32_t)ChunkSize, current_chunk->count.load(std::memory_order_acquire));
             for (uint32_t i = 0; i < count; ++i) {
                 if (current_chunk->tags[i] == probe_tag && current_chunk->keys[i] == key) {
                     results.push_back(current_chunk->values[i]);
@@ -199,7 +196,7 @@ public:
             if (current_chunk->next.load(std::memory_order_relaxed)) {
                 __builtin_prefetch(current_chunk->next.load(std::memory_order_relaxed), 0, 0);
             }
-            uint32_t count = std::min((uint32_t)CHUNK_SIZE, current_chunk->count.load(std::memory_order_acquire));
+            uint32_t count = std::min((uint32_t)ChunkSize, current_chunk->count.load(std::memory_order_acquire));
             for (uint32_t i = 0; i < count; ++i) {
                 if (current_chunk->tags[i] == probe_tag && current_chunk->keys[i] == key) {
                     match_count++;
@@ -223,7 +220,7 @@ public:
                 if (current_chunk->next.load(std::memory_order_relaxed)) {
                     __builtin_prefetch(current_chunk->next.load(std::memory_order_relaxed), 0, 0);
                 }
-                uint32_t count = std::min((uint32_t)CHUNK_SIZE, current_chunk->count.load(std::memory_order_acquire));
+                uint32_t count = std::min((uint32_t)ChunkSize, current_chunk->count.load(std::memory_order_acquire));
 
 #if defined(__AVX2__)
                 const __m256i v_probe_tag = _mm256_set1_epi8(probe_tag);
@@ -273,7 +270,7 @@ public:
                 if (current_chunk->next.load(std::memory_order_relaxed)) {
                     __builtin_prefetch(current_chunk->next.load(std::memory_order_relaxed), 0, 0);
                 }
-                uint32_t count = std::min((uint32_t)CHUNK_SIZE, current_chunk->count.load(std::memory_order_acquire));
+                uint32_t count = std::min((uint32_t)ChunkSize, current_chunk->count.load(std::memory_order_acquire));
 
 #if defined(__AVX2__)
                 const __m256i v_probe_tag = _mm256_set1_epi8(probe_tag);
@@ -335,12 +332,12 @@ py::tuple hash_join_two_pass(py::array_t<uint64_t> build_keys,
 
     size_t num_threads = std::thread::hardware_concurrency();
     std::vector<std::thread> threads;
-    size_t chunk_size = (probe_size + num_threads - 1) / num_threads;
+    size_t ChunkSize = (probe_size + num_threads - 1) / num_threads;
 
     std::vector<PaddedCounter> counts(num_threads);
 
     for (size_t i = 0; i < num_threads; ++i) {
-        size_t start = i * chunk_size; size_t end = std::min(start + chunk_size, probe_size);
+        size_t start = i * ChunkSize; size_t end = std::min(start + ChunkSize, probe_size);
         if (start >= end) continue;
         threads.emplace_back([&ht, &counts, i, probe_keys_ptr, start, end]() {
             std::vector<uint64_t> local_results; size_t local_count = 0;
@@ -367,7 +364,7 @@ py::tuple hash_join_two_pass(py::array_t<uint64_t> build_keys,
     uint64_t* result_values_ptr = static_cast<uint64_t*>(result_values.request().ptr);
 
     for (size_t i = 0; i < num_threads; ++i) {
-        size_t start = i * chunk_size; size_t end = std::min(start + chunk_size, probe_size);
+        size_t start = i * ChunkSize; size_t end = std::min(start + ChunkSize, probe_size);
         if (start >= end) continue;
         threads.emplace_back([&ht, probe_keys_ptr, result_keys_ptr, result_values_ptr, &offsets, i, start, end]() {
             std::vector<uint64_t> local_results; size_t current_offset = offsets[i];
@@ -402,13 +399,13 @@ py::int_ hash_join_count_optimized(py::array_t<uint64_t> build_keys,
 
     size_t num_threads = std::thread::hardware_concurrency();
     std::vector<std::thread> threads;
-    size_t chunk_size = (probe_size + num_threads - 1) / num_threads;
+    size_t ChunkSize = (probe_size + num_threads - 1) / num_threads;
     
     std::vector<PaddedCounter> counts(num_threads);
 
     for (size_t i = 0; i < num_threads; ++i) {
-        size_t start = i * chunk_size;
-        size_t end = std::min(start + chunk_size, probe_size);
+        size_t start = i * ChunkSize;
+        size_t end = std::min(start + ChunkSize, probe_size);
         if (start >= end) continue;
         threads.emplace_back([&ht, &counts, i, probe_keys_ptr, start, end]() {
             size_t local_count = 0;
@@ -446,13 +443,13 @@ py::tuple hash_join_batch(py::array_t<uint64_t> build_keys,
 
     size_t num_threads = std::thread::hardware_concurrency();
     std::vector<std::thread> threads;
-    size_t chunk_size = (probe_size + num_threads - 1) / num_threads;
+    size_t ChunkSize = (probe_size + num_threads - 1) / num_threads;
 
     std::vector<PaddedCounter> counts(num_threads);
 
     for (size_t i = 0; i < num_threads; ++i) {
-        size_t start = i * chunk_size;
-        size_t end = std::min(start + chunk_size, probe_size);
+        size_t start = i * ChunkSize;
+        size_t end = std::min(start + ChunkSize, probe_size);
         if (start >= end) continue;
         threads.emplace_back([&, i, start, end]() {
             size_t local_count = ht.probe_and_count_batch(&probe_keys_ptr[start], end - start);
@@ -476,8 +473,8 @@ py::tuple hash_join_batch(py::array_t<uint64_t> build_keys,
     uint64_t* result_values_ptr = static_cast<uint64_t*>(result_values.request().ptr);
 
     for (size_t i = 0; i < num_threads; ++i) {
-        size_t start = i * chunk_size;
-        size_t end = std::min(start + chunk_size, probe_size);
+        size_t start = i * ChunkSize;
+        size_t end = std::min(start + ChunkSize, probe_size);
         if (start >= end) continue;
         threads.emplace_back([&, i, start, end]() {
             ht.probe_batch_write(&probe_keys_ptr[start], end - start, 
@@ -508,13 +505,13 @@ py::int_ hash_join_count_batch(py::array_t<uint64_t> build_keys,
 
     size_t num_threads = std::thread::hardware_concurrency();
     std::vector<std::thread> threads;
-    size_t chunk_size = (probe_size + num_threads - 1) / num_threads;
+    size_t ChunkSize = (probe_size + num_threads - 1) / num_threads;
     
     std::vector<PaddedCounter> counts(num_threads);
 
     for (size_t i = 0; i < num_threads; ++i) {
-        size_t start = i * chunk_size;
-        size_t end = std::min(start + chunk_size, probe_size);
+        size_t start = i * ChunkSize;
+        size_t end = std::min(start + ChunkSize, probe_size);
         if (start >= end) continue;
         threads.emplace_back([&, i, start, end]() {
             size_t local_count = ht.probe_and_count_batch(&probe_keys_ptr[start], end - start);
