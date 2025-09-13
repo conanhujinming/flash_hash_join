@@ -8,10 +8,12 @@ find_package(pybind11 REQUIRED)
 # --- OpenMP ---
 find_package(OpenMP REQUIRED)
 
-# --- mimalloc (Build from Subdirectory) ---
+# --- mimalloc (Re-enabled with proper configuration) ---
 set(MI_BUILD_TESTS OFF CACHE BOOL "Disable mimalloc tests")
 set(MI_BUILD_SHARED OFF CACHE BOOL "Build mimalloc as a static library")
 set(MI_BUILD_STATIC ON CACHE BOOL "Build mimalloc as a static library")
+set(MI_OVERRIDE OFF CACHE BOOL "Don't override system malloc")
+set(MI_MALLOC_OVERRIDE OFF CACHE BOOL "Don't override malloc globally")
 add_subdirectory(mimalloc)
 
 # --- Create Python Module Target ---
