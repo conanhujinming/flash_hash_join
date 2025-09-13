@@ -15,22 +15,18 @@ set(MI_BUILD_STATIC ON CACHE BOOL "Build mimalloc as a static library")
 add_subdirectory(mimalloc)
 
 # --- Create Python Module Target ---
-pybind11_add_module(fast_join hash_join.cpp) #<-- 我把你的文件名改成了hash_join.cpp
+pybind11_add_module(fast_join SHARED hash_join.cpp)
 
 # --- Link Libraries and Set Include Directories ---
 
-# ************************ 关键修复 ************************
-# 明确地告诉 fast_join 目标去 mimalloc/include 目录寻找头文件
 target_include_directories(fast_join PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/mimalloc/include)
-# **********************************************************
 
-target_link_libraries(fast_join PRIVATE
-    mimalloc-static
+target_link_libraries(fast_join PRIVATE mimalloc-static
     pthread
     pybind11::module
     Python::Module
     OpenMP::OpenMP_CXX
-)
+    )
 
 # --- Compiler Flags for Performance ---
 target_compile_features(fast_join PRIVATE cxx_std_17)

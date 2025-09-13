@@ -18,6 +18,10 @@ except ImportError:
     print("Error: Could not import 'duckdb' module. Please run: pip install duckdb")
     sys.exit(1)
 
+print("Initializing custom memory system...")
+fast_join.initialize()
+print("Initialization complete.")
+
 # --- (generate_data function remains the same) ---
 def generate_data(build_size, probe_size):
     print("="*40)
@@ -47,6 +51,7 @@ if __name__ == "__main__":
 
     # --- 1. Benchmark our C++ (fast_join) ---
     print("\n🚀 Starting benchmark for C++ (fast_join) [End-to-End]...")
+
     start_time_cpp = time.perf_counter()
     cpp_count = fast_join.hash_join_count(build_keys, build_values, probe_keys)
     end_time_cpp = time.perf_counter()
@@ -59,15 +64,15 @@ if __name__ == "__main__":
     duration_cpp = end_time_cpp - start_time_cpp
     print(f"C++ (fast_join) finished in: {duration_cpp:.4f} seconds")
 
-    print("\n🚀 Starting benchmark for C++ (fast_join) [End-to-End]...")
+    print("\n🚀 Starting benchmark for C++ (fast_join_scalar) [End-to-End]...")
     start_time_cpp = time.perf_counter()
-    cpp_count = fast_join.hash_join_count_original(build_keys, build_values, probe_keys)
+    cpp_count = fast_join.hash_join_count_scalar(build_keys, build_values, probe_keys)
     end_time_cpp = time.perf_counter()
     duration_cpp = end_time_cpp - start_time_cpp
     print(f"C++ (fast_join_count_scalar) finished in: {duration_cpp:.4f} seconds")
 
     start_time_cpp = time.perf_counter()
-    cpp_count = fast_join.hash_join_original(build_keys, build_values, probe_keys)
+    cpp_count = fast_join.hash_join_scalar(build_keys, build_values, probe_keys)
     end_time_cpp = time.perf_counter()
     duration_cpp = end_time_cpp - start_time_cpp
     print(f"C++ (fast_join_scalar) finished in: {duration_cpp:.4f} seconds")
