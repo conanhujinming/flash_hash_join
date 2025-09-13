@@ -59,6 +59,19 @@ if __name__ == "__main__":
     duration_cpp = end_time_cpp - start_time_cpp
     print(f"C++ (fast_join) finished in: {duration_cpp:.4f} seconds")
 
+    print("\n🚀 Starting benchmark for C++ (fast_join) [End-to-End]...")
+    start_time_cpp = time.perf_counter()
+    cpp_count = fast_join.hash_join_count_original(build_keys, build_values, probe_keys)
+    end_time_cpp = time.perf_counter()
+    duration_cpp = end_time_cpp - start_time_cpp
+    print(f"C++ (fast_join_count_scalar) finished in: {duration_cpp:.4f} seconds")
+
+    start_time_cpp = time.perf_counter()
+    cpp_count = fast_join.hash_join_original(build_keys, build_values, probe_keys)
+    end_time_cpp = time.perf_counter()
+    duration_cpp = end_time_cpp - start_time_cpp
+    print(f"C++ (fast_join_scalar) finished in: {duration_cpp:.4f} seconds")
+
     build_file = 'build.parquet'
     probe_file = 'probe.parquet'
     pq.write_table(pa.Table.from_pandas(build_df), build_file)

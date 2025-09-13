@@ -9,6 +9,11 @@
 #include <functional>
 #include <numeric>
 
+// AVX2 and other intrinsics
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
@@ -16,7 +21,6 @@
 #include <mimalloc.h>
 #define XXH_INLINE_ALL
 #include "xxhash.h"
-#include <omp.h>
 
 namespace py = pybind11;
 
@@ -26,7 +30,7 @@ struct Hasher {
 };
 
 constexpr size_t CHUNK_SIZE = 256;
-constexpr size_t NUM_LOCKS = 1024;
+constexpr size_t NUM_LOCKS = 4096;
 
 struct alignas(64) PaddedCounter {
     std::atomic<size_t> value{0};
@@ -35,7 +39,6 @@ struct alignas(64) PaddedCounter {
 template<typename KeyType, typename ValueType>
 struct UnchainedHashTable {
 private:
-    // --- Data Layout Change: From AoS to SoA (Structure of Arrays) ---
     struct alignas(64) Chunk {
         std::atomic<uint32_t> count{0};
         std::atomic<Chunk*> next{nullptr};
@@ -43,7 +46,6 @@ private:
         KeyType   keys[CHUNK_SIZE];
         ValueType values[CHUNK_SIZE];
     };
-    // --------------------------------------------------------------------
 
     std::unique_ptr<char[]> memory_pool_;
     std::atomic<size_t> pool_offset_{0};
@@ -60,6 +62,7 @@ public:
     size_t get_bucket_count() const { return buckets_.size(); }
 
     static size_t calculate_size(size_t initial_size) {
+        if (initial_size == 0) return 1;
         size_t size = 1;
         while (size < initial_size) size <<= 1;
         return size;
@@ -70,11 +73,9 @@ public:
           locks_(NUM_LOCKS) 
     {
         if (build_size_hint > 0) {
-            size_t num_chunks_needed = (size_t)(build_size_hint * 1.5) / CHUNK_SIZE;
-            if (num_chunks_needed == 0) num_chunks_needed = 1;
+            size_t num_chunks_needed = (size_t)(build_size_hint * 1.5) / CHUNK_SIZE + 1;
             pool_size_bytes_ = num_chunks_needed * sizeof(Chunk);
             size_t alignment = alignof(Chunk);
-            pool_size_bytes_ += alignment;
             memory_pool_ = std::unique_ptr<char[]>((char*)mi_malloc_aligned(pool_size_bytes_, alignment));
         }
     }
@@ -86,6 +87,23 @@ public:
             return new (ptr) Chunk();
         }
         return new (mi_malloc_aligned(sizeof(Chunk), alignof(Chunk))) Chunk();
+    }
+    
+    // Custom deallocator to handle the two-tiered allocation strategy.
+    void free_chunk(Chunk* chunk) {
+        // Check if the chunk was allocated from the main memory pool
+        char* chunk_addr = reinterpret_cast<char*>(chunk);
+        char* pool_start = memory_pool_.get();
+        char* pool_end = pool_start + pool_size_bytes_;
+        
+        if (chunk_addr >= pool_start && chunk_addr < pool_end) {
+            // From the pool: do nothing. Memory will be reclaimed when the table is destroyed.
+            // We accept the small internal fragmentation.
+        } else {
+            // From mi_malloc_aligned: must be freed individually.
+            chunk->~Chunk(); // Manually call destructor for placement new
+            mi_free(chunk);
+        }
     }
     
     void insert(const KeyType& key, const ValueType& value) {
@@ -125,9 +143,13 @@ public:
                 new_chunk->count.store(1, std::memory_order_release);
                 Chunk* expected = nullptr;
                 if (current_chunk->next.compare_exchange_strong(expected, new_chunk, std::memory_order_acq_rel)) {
-                    return;
+                    return; // Success
                 } else {
-                    current_chunk = expected;
+                    // We lost the race, another thread inserted a chunk.
+                    // The 'expected' pointer is now updated to point to the new chunk.
+                    // We must deallocate the chunk we created to avoid a leak.
+                    free_chunk(new_chunk);
+                    current_chunk = expected; // Continue search from the new chunk.
                 }
             } else { current_chunk = next_chunk; }
         }
@@ -156,7 +178,7 @@ public:
             if (current_chunk->next.load(std::memory_order_relaxed)) {
                 __builtin_prefetch(current_chunk->next.load(std::memory_order_relaxed), 0, 0);
             }
-            uint32_t count = current_chunk->count.load(std::memory_order_acquire);
+            uint32_t count = std::min((uint32_t)CHUNK_SIZE, current_chunk->count.load(std::memory_order_acquire));
             for (uint32_t i = 0; i < count; ++i) {
                 if (current_chunk->tags[i] == probe_tag && current_chunk->keys[i] == key) {
                     results.push_back(current_chunk->values[i]);
@@ -177,7 +199,7 @@ public:
             if (current_chunk->next.load(std::memory_order_relaxed)) {
                 __builtin_prefetch(current_chunk->next.load(std::memory_order_relaxed), 0, 0);
             }
-            uint32_t count = current_chunk->count.load(std::memory_order_acquire);
+            uint32_t count = std::min((uint32_t)CHUNK_SIZE, current_chunk->count.load(std::memory_order_acquire));
             for (uint32_t i = 0; i < count; ++i) {
                 if (current_chunk->tags[i] == probe_tag && current_chunk->keys[i] == key) {
                     match_count++;
@@ -187,8 +209,114 @@ public:
         }
         return match_count;
     }
+
+    size_t probe_and_count_batch(const KeyType* probe_keys, size_t batch_size) const {
+        size_t total_match_count = 0;
+        for (size_t i = 0; i < batch_size; ++i) {
+            const auto& key = probe_keys[i];
+            uint64_t hash = hasher_(key);
+            uint64_t bucket_idx = get_bucket_idx(hash);
+            uint8_t probe_tag = get_hash_tag(hash);
+            
+            Chunk* current_chunk = buckets_[bucket_idx].load(std::memory_order_acquire);
+            while (current_chunk != nullptr) {
+                if (current_chunk->next.load(std::memory_order_relaxed)) {
+                    __builtin_prefetch(current_chunk->next.load(std::memory_order_relaxed), 0, 0);
+                }
+                uint32_t count = std::min((uint32_t)CHUNK_SIZE, current_chunk->count.load(std::memory_order_acquire));
+
+#if defined(__AVX2__)
+                const __m256i v_probe_tag = _mm256_set1_epi8(probe_tag);
+                size_t j = 0;
+                for (; j + 31 < count; j += 32) {
+                    __m256i v_chunk_tags = _mm256_loadu_si256((const __m256i*)&current_chunk->tags[j]);
+                    __m256i v_cmp_mask = _mm256_cmpeq_epi8(v_probe_tag, v_chunk_tags);
+                    uint32_t bitmask = _mm256_movemask_epi8(v_cmp_mask);
+                    
+                    while (bitmask != 0) {
+                        int pos = __builtin_ctz(bitmask);
+                        if (current_chunk->keys[j + pos] == key) {
+                            total_match_count++;
+                        }
+                        bitmask &= bitmask - 1;
+                    }
+                }
+                for (; j < count; ++j) {
+                    if (current_chunk->tags[j] == probe_tag && current_chunk->keys[j] == key) {
+                        total_match_count++;
+                    }
+                }
+#else
+                for (uint32_t j = 0; j < count; ++j) {
+                    if (current_chunk->tags[j] == probe_tag && current_chunk->keys[j] == key) {
+                        total_match_count++;
+                    }
+                }
+#endif
+                current_chunk = current_chunk->next.load(std::memory_order_acquire);
+            }
+        }
+        return total_match_count;
+    }
+    
+    size_t probe_batch_write(const KeyType* probe_keys, size_t batch_size,
+                             KeyType* out_keys_ptr, ValueType* out_values_ptr) const {
+        size_t matches_written = 0;
+        for (size_t i = 0; i < batch_size; ++i) {
+            const auto& key = probe_keys[i];
+            uint64_t hash = hasher_(key);
+            uint64_t bucket_idx = get_bucket_idx(hash);
+            uint8_t probe_tag = get_hash_tag(hash);
+            
+            Chunk* current_chunk = buckets_[bucket_idx].load(std::memory_order_acquire);
+            while (current_chunk != nullptr) {
+                if (current_chunk->next.load(std::memory_order_relaxed)) {
+                    __builtin_prefetch(current_chunk->next.load(std::memory_order_relaxed), 0, 0);
+                }
+                uint32_t count = std::min((uint32_t)CHUNK_SIZE, current_chunk->count.load(std::memory_order_acquire));
+
+#if defined(__AVX2__)
+                const __m256i v_probe_tag = _mm256_set1_epi8(probe_tag);
+                size_t j = 0;
+                for (; j + 31 < count; j += 32) {
+                    __m256i v_chunk_tags = _mm256_loadu_si256((const __m256i*)&current_chunk->tags[j]);
+                    __m256i v_cmp_mask = _mm256_cmpeq_epi8(v_probe_tag, v_chunk_tags);
+                    uint32_t bitmask = _mm256_movemask_epi8(v_cmp_mask);
+                    
+                    while (bitmask != 0) {
+                        int pos = __builtin_ctz(bitmask);
+                        if (current_chunk->keys[j + pos] == key) {
+                            out_keys_ptr[matches_written] = key;
+                            out_values_ptr[matches_written] = current_chunk->values[j + pos];
+                            matches_written++;
+                        }
+                        bitmask &= bitmask - 1;
+                    }
+                }
+                for (; j < count; ++j) {
+                     if (current_chunk->tags[j] == probe_tag && current_chunk->keys[j] == key) {
+                        out_keys_ptr[matches_written] = key;
+                        out_values_ptr[matches_written] = current_chunk->values[j];
+                        matches_written++;
+                    }
+                }
+#else
+                for (uint32_t j = 0; j < count; ++j) {
+                    if (current_chunk->tags[j] == probe_tag && current_chunk->keys[j] == key) {
+                        out_keys_ptr[matches_written] = key;
+                        out_values_ptr[matches_written] = current_chunk->values[j];
+                        matches_written++;
+                    }
+                }
+#endif
+                current_chunk = current_chunk->next.load(std::memory_order_acquire);
+            }
+        }
+        return matches_written;
+    }
 };
 
+// Python wrapper functions
 py::tuple hash_join_two_pass(py::array_t<uint64_t> build_keys,
                              py::array_t<uint64_t> build_values,
                              py::array_t<uint64_t> probe_keys) {
@@ -284,17 +412,7 @@ py::int_ hash_join_count_optimized(py::array_t<uint64_t> build_keys,
         if (start >= end) continue;
         threads.emplace_back([&ht, &counts, i, probe_keys_ptr, start, end]() {
             size_t local_count = 0;
-            Hasher<uint64_t> hasher;
-            const auto* buckets_ptr = ht.get_buckets_ptr();
-            const size_t bucket_mask = ht.get_bucket_count() - 1;
-            constexpr size_t PREFETCH_DISTANCE = 32; 
-
-            for (size_t j = start; j < end - PREFETCH_DISTANCE; ++j) {
-                uint64_t future_hash = hasher(probe_keys_ptr[j + PREFETCH_DISTANCE]);
-                __builtin_prefetch(&buckets_ptr[future_hash & bucket_mask], 0, 0);
-                local_count += ht.probe_and_count(probe_keys_ptr[j]);
-            }
-            for (size_t j = std::max(start, end - PREFETCH_DISTANCE); j < end; ++j) {
+            for (size_t j = start; j < end; ++j) {
                 local_count += ht.probe_and_count(probe_keys_ptr[j]);
             }
             counts[i].value.store(local_count, std::memory_order_relaxed);
@@ -310,14 +428,121 @@ py::int_ hash_join_count_optimized(py::array_t<uint64_t> build_keys,
     return py::int_(total_results);
 }
 
-PYBIND11_MODULE(fast_join, m) {
-    m.doc() = "A high-performance hash join with SoA, Arena Allocator and Prefetching"; 
+py::tuple hash_join_batch(py::array_t<uint64_t> build_keys,
+                          py::array_t<uint64_t> build_values,
+                          py::array_t<uint64_t> probe_keys) {
+    py::buffer_info build_keys_buf = build_keys.request();
+    py::buffer_info build_values_buf = build_values.request();
+    py::buffer_info probe_keys_buf = probe_keys.request();
+
+    const uint64_t* build_keys_ptr = static_cast<uint64_t*>(build_keys_buf.ptr);
+    const uint64_t* build_values_ptr = static_cast<uint64_t*>(build_values_buf.ptr);
+    const uint64_t* probe_keys_ptr = static_cast<uint64_t*>(probe_keys_buf.ptr);
+    size_t build_size = build_keys_buf.size;
+    size_t probe_size = probe_keys_buf.size;
+
+    UnchainedHashTable<uint64_t, uint64_t> ht(build_size, build_size);
+    ht.build(build_keys_ptr, build_values_ptr, build_size);
+
+    size_t num_threads = std::thread::hardware_concurrency();
+    std::vector<std::thread> threads;
+    size_t chunk_size = (probe_size + num_threads - 1) / num_threads;
+
+    std::vector<PaddedCounter> counts(num_threads);
+
+    for (size_t i = 0; i < num_threads; ++i) {
+        size_t start = i * chunk_size;
+        size_t end = std::min(start + chunk_size, probe_size);
+        if (start >= end) continue;
+        threads.emplace_back([&, i, start, end]() {
+            size_t local_count = ht.probe_and_count_batch(&probe_keys_ptr[start], end - start);
+            counts[i].value.store(local_count, std::memory_order_relaxed);
+        });
+    }
+    for (auto& t : threads) { t.join(); }
+    threads.clear();
+
+    size_t total_results = 0;
+    std::vector<size_t> offsets(num_threads + 1, 0);
+    for (size_t i = 0; i < num_threads; ++i) {
+        size_t count = counts[i].value.load(std::memory_order_relaxed);
+        offsets[i+1] = offsets[i] + count;
+        total_results += count;
+    }
     
-    m.def("hash_join", &hash_join_two_pass, 
-          "Performs a hash join and returns the full result",
+    py::array_t<uint64_t> result_keys(total_results);
+    py::array_t<uint64_t> result_values(total_results);
+    uint64_t* result_keys_ptr = static_cast<uint64_t*>(result_keys.request().ptr);
+    uint64_t* result_values_ptr = static_cast<uint64_t*>(result_values.request().ptr);
+
+    for (size_t i = 0; i < num_threads; ++i) {
+        size_t start = i * chunk_size;
+        size_t end = std::min(start + chunk_size, probe_size);
+        if (start >= end) continue;
+        threads.emplace_back([&, i, start, end]() {
+            ht.probe_batch_write(&probe_keys_ptr[start], end - start, 
+                                 result_keys_ptr + offsets[i], 
+                                 result_values_ptr + offsets[i]);
+        });
+    }
+    for (auto& t : threads) { t.join(); }
+
+    return py::make_tuple(result_keys, result_values);
+}
+
+py::int_ hash_join_count_batch(py::array_t<uint64_t> build_keys,
+                               py::array_t<uint64_t> build_values,
+                               py::array_t<uint64_t> probe_keys) {
+    py::buffer_info build_keys_buf = build_keys.request();
+    py::buffer_info build_values_buf = build_values.request();
+    py::buffer_info probe_keys_buf = probe_keys.request();
+
+    const uint64_t* build_keys_ptr = static_cast<uint64_t*>(build_keys_buf.ptr);
+    const uint64_t* build_values_ptr = static_cast<uint64_t*>(build_values_buf.ptr);
+    const uint64_t* probe_keys_ptr = static_cast<uint64_t*>(probe_keys_buf.ptr);
+    size_t build_size = build_keys_buf.size;
+    size_t probe_size = probe_keys_buf.size;
+
+    UnchainedHashTable<uint64_t, uint64_t> ht(build_size, build_size);
+    ht.build(build_keys_ptr, build_values_ptr, build_size);
+
+    size_t num_threads = std::thread::hardware_concurrency();
+    std::vector<std::thread> threads;
+    size_t chunk_size = (probe_size + num_threads - 1) / num_threads;
+    
+    std::vector<PaddedCounter> counts(num_threads);
+
+    for (size_t i = 0; i < num_threads; ++i) {
+        size_t start = i * chunk_size;
+        size_t end = std::min(start + chunk_size, probe_size);
+        if (start >= end) continue;
+        threads.emplace_back([&, i, start, end]() {
+            size_t local_count = ht.probe_and_count_batch(&probe_keys_ptr[start], end - start);
+            counts[i].value.store(local_count, std::memory_order_relaxed);
+        });
+    }
+    for (auto& t : threads) { t.join(); }
+
+    size_t total_results = 0;
+    for (size_t i = 0; i < num_threads; ++i) {
+        total_results += counts[i].value.load(std::memory_order_relaxed);
+    }
+
+    return py::int_(total_results);
+}
+
+
+PYBIND11_MODULE(fast_join, m) {
+    m.doc() = "A high-performance hash join with SoA, Arena Allocator, Prefetching, and SIMD"; 
+    
+    m.def("hash_join", &hash_join_batch, 
+          "Performs a hash join and returns the full result (SIMD Batched)",
           py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
 
-    m.def("hash_join_count", &hash_join_count_optimized, 
-          "Performs a hash join and returns only the count of results (Optimized)",
+    m.def("hash_join_count", &hash_join_count_batch, 
+          "Performs a hash join and returns only the count of results (SIMD Batched)",
           py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
+
+    m.def("hash_join_original", &hash_join_two_pass, "Original two-pass hash join (now fixed)");
+    m.def("hash_join_count_original", &hash_join_count_optimized, "Original optimized count hash join (now fixed)");
 }
