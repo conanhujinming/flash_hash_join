@@ -18,6 +18,7 @@
 
 #include <nmmintrin.h> // Header for SSE4.2 intrinsics
 
+#define PYBIND11_NO_ATEXIT
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
@@ -25,6 +26,8 @@
 // Re-enable mimalloc with proper configuration
 #define MI_OVERRIDE 0  // Don't override system malloc
 #define MI_MALLOC_OVERRIDE 0  // Don't override malloc
+#define MI_USENOPROCS 1
+#define MI_NO_DEINIT 1  
 #include <mimalloc.h>
 
 namespace py = pybind11;
@@ -95,7 +98,19 @@ public:
         }
     }
 
-    ~UnchainedHashTable() {}
+    ~UnchainedHashTable() {
+        for (size_t i = 0; i < buckets_.size(); ++i) {
+            Chunk* current_chunk = buckets_[i].load(std::memory_order_relaxed);
+            while (current_chunk != nullptr) {
+                Chunk* next = current_chunk->next.load(std::memory_order_relaxed);
+                // We must decide how to free it.
+                // The free_chunk logic correctly handles pool vs. non-pool chunks.
+                free_chunk(current_chunk);
+                current_chunk = next;
+            }
+        }
+        // memory_pool_ is freed automatically by unique_ptr after this loop.
+    }
     
     UnchainedHashTable(const UnchainedHashTable&) = delete;
     UnchainedHashTable& operator=(const UnchainedHashTable&) = delete;
@@ -112,13 +127,21 @@ public:
     }
     
     void free_chunk(Chunk* chunk) {
+        // Safety check
+        if (!chunk) return;
+
         char* chunk_addr = reinterpret_cast<char*>(chunk);
         char* pool_start = memory_pool_.get();
-        char* pool_end = pool_start + pool_size_bytes_;
         
-        if (!(chunk_addr >= pool_start && chunk_addr < pool_end)) {
-            chunk->~Chunk();
+        // Check if the chunk is NOT from the pool
+        // Also check if pool_start is valid before dereferencing
+        if (!pool_start || !(chunk_addr >= pool_start && chunk_addr < pool_start + pool_size_bytes_)) {
+            chunk->~Chunk(); // Explicitly call destructor for non-pod members
             mi_free(chunk); 
+        } else {
+            // It's from the pool. We could optionally call its destructor if needed.
+            // For current Chunk struct, it's not strictly necessary.
+             chunk->~Chunk(); 
         }
     }
     
@@ -181,6 +204,61 @@ public:
             });
         }
         for (auto& t : threads) { t.join(); }
+    }
+
+    size_t probe_write(const KeyType& key, KeyType* out_keys_ptr, ValueType* out_values_ptr) const {
+        uint64_t hash = hasher_(key);
+        uint64_t bucket_idx = get_bucket_idx(hash);
+        uint8_t probe_tag = get_hash_tag(hash);
+        size_t matches_written = 0;
+
+        Chunk* current_chunk = buckets_[bucket_idx].load(std::memory_order_acquire);
+        
+        while (current_chunk != nullptr) {
+            if (current_chunk->next.load(std::memory_order_relaxed)) {
+                __builtin_prefetch(current_chunk->next.load(std::memory_order_relaxed), 0, 0);
+            }
+            uint32_t count = std::min((uint32_t)ChunkSize, current_chunk->count.load(std::memory_order_acquire));
+
+    #if defined(__AVX2__)
+            const __m256i v_probe_tag = _mm256_set1_epi8(probe_tag);
+            size_t j = 0;
+            for (; j + 31 < count; j += 32) {
+                __m256i v_chunk_tags = _mm256_loadu_si256((const __m256i*)&current_chunk->tags[j]);
+                __m256i v_cmp_mask = _mm256_cmpeq_epi8(v_probe_tag, v_chunk_tags);
+                uint32_t bitmask = _mm256_movemask_epi8(v_cmp_mask);
+                
+                while (bitmask != 0) {
+                    int pos = __builtin_ctz(bitmask);
+                    if (current_chunk->keys[j + pos] == key) {
+                        out_keys_ptr[matches_written] = key;
+                        out_values_ptr[matches_written] = current_chunk->values[j + pos];
+                        matches_written++;
+                    }
+                    bitmask &= bitmask - 1;
+                }
+            }
+            // Scalar remainder
+            for (; j < count; ++j) {
+                if (current_chunk->tags[j] == probe_tag && current_chunk->keys[j] == key) {
+                    out_keys_ptr[matches_written] = key;
+                    out_values_ptr[matches_written] = current_chunk->values[j];
+                    matches_written++;
+                }
+            }
+    #else
+            // Original scalar implementation
+            for (uint32_t i = 0; i < count; ++i) {
+                if (current_chunk->tags[i] == probe_tag && current_chunk->keys[i] == key) {
+                    out_keys_ptr[matches_written] = key;
+                    out_values_ptr[matches_written] = current_chunk->values[i];
+                    matches_written++;
+                }
+            }
+    #endif
+            current_chunk = current_chunk->next.load(std::memory_order_acquire);
+        }
+        return matches_written;
     }
     
     void probe(const KeyType& key, std::vector<ValueType>& results) const {
@@ -421,18 +499,16 @@ py::tuple hash_join_scalar(py::array_t<uint32_t> build_keys,
                            py::array_t<uint32_t> build_values,
                            py::array_t<uint32_t> probe_keys) {
     py::buffer_info build_keys_buf = build_keys.request();
-    py::buffer_info build_values_buf = build_values.request();
     py::buffer_info probe_keys_buf = probe_keys.request();
     const uint32_t* probe_keys_ptr = static_cast<uint32_t*>(probe_keys_buf.ptr);
     size_t probe_size = probe_keys_buf.size;
 
     HT ht(build_keys_buf.size, build_keys_buf.size);
     ht.build(static_cast<uint32_t*>(build_keys_buf.ptr),
-             static_cast<uint32_t*>(build_values_buf.ptr),
+             static_cast<uint32_t*>(build_values.request().ptr),
              build_keys_buf.size);
 
     size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
-    std::cout << "num_threads = " << num_threads << std::endl;
     auto [total_results, offsets] = count_scalar_pass(ht, probe_keys_ptr, probe_size, num_threads);
 
     py::array_t<uint32_t> result_keys(total_results);
@@ -447,16 +523,17 @@ py::tuple hash_join_scalar(py::array_t<uint32_t> build_keys,
         size_t end = std::min(start + work_per_thread, probe_size);
         if (start >= end) continue;
         threads.emplace_back([&, i, start, end]() {
-            std::vector<uint32_t> local_results;
+            // Get the starting write position for this thread
             size_t current_offset = offsets[i];
             for (size_t j = start; j < end; ++j) {
-                local_results.clear();
-                ht.probe(probe_keys_ptr[j], local_results);
-                for (const auto& val : local_results) {
-                    result_keys_ptr[current_offset] = probe_keys_ptr[j];
-                    result_values_ptr[current_offset] = val;
-                    current_offset++;
-                }
+                // Directly write results to the final destination
+                size_t matches_found = ht.probe_write(
+                    probe_keys_ptr[j],
+                    result_keys_ptr + current_offset,
+                    result_values_ptr + current_offset
+                );
+                // Advance the write pointer by the number of matches found
+                current_offset += matches_found;
             }
         });
     }
@@ -534,6 +611,7 @@ void initialize_memory_system() {
 }
 
 PYBIND11_MODULE(flash_join, m) {
+    initialize_memory_system();
     m.doc() = "A high-performance hash join with various optimization strategies"; 
     m.def("hash_join", &hash_join_batch, 
           "Performs a hash join and returns the full result",

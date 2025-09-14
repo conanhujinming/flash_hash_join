@@ -5,9 +5,6 @@ project(flash_join)
 find_package(Python 3.10 COMPONENTS Interpreter Development REQUIRED)
 find_package(pybind11 REQUIRED)
 
-# --- OpenMP ---
-find_package(OpenMP REQUIRED)
-
 # --- mimalloc (Re-enabled with proper configuration) ---
 set(MI_BUILD_TESTS OFF CACHE BOOL "Disable mimalloc tests")
 set(MI_BUILD_SHARED OFF CACHE BOOL "Build mimalloc as a static library")
@@ -27,7 +24,6 @@ target_link_libraries(flash_join PRIVATE mimalloc-static
     pthread
     pybind11::module
     Python::Module
-    OpenMP::OpenMP_CXX
     )
 
 # --- Compiler Flags for Performance ---
