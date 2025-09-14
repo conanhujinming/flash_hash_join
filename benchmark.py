@@ -4,6 +4,10 @@ import argparse
 import time
 import numpy as np
 import pandas as pd
+import re
+import glob
+from collections import defaultdict
+import pandas.api.types as ptypes
 
 # --- Module Import and Initialization ---
 # Import flash_join FIRST to avoid potential memory allocator conflicts with other libraries.
@@ -27,131 +31,241 @@ except ImportError as e:
     print(f"CRITICAL: Could not import 'duckdb' module: {e}", file=sys.stderr)
     sys.exit(1)
 
-print("All modules imported and initialized successfully!")
-print("-" * 60)
+# Import and check for plotting libraries
+try:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    print("Plotting libraries (matplotlib, seaborn) loaded successfully.")
+except ImportError:
+    print("\nWARNING: Plotting libraries not found. Results will not be visualized.")
+    print("Please run 'pip install matplotlib seaborn' to enable plotting.")
+    plt = None
+    sns = None
+
+print("-" * 80)
 
 
 # --- Helper Function for Benchmarking ---
 def run_benchmark(label, task_name, threads, func):
     """
-    A helper function to run a benchmark, time it, and print results in two formats.
+    A helper function to run a benchmark, time it, and print results in a standard format.
     - func: A no-argument lambda function that executes the actual benchmark and returns a result.
     """
-    print(f"\n🚀 Starting benchmark for {label} ({task_name})...")
+    print(f"\n  🚀 Starting benchmark for {label} ({task_name})...")
     start_time = time.perf_counter()
     result = func()
     end_time = time.perf_counter()
     duration = end_time - start_time
     
     # User-friendly print
-    print(f"   - Finished in: {duration:.4f} seconds")
+    print(f"     - Finished in: {duration:.4f} seconds")
     if isinstance(result, (int, np.integer)):
-        print(f"   - Result (count): {result:,}")
+        print(f"     - Result (count): {result:,}")
         result_str = str(result)
     elif result is not None:
-        # For full join results, we print the length to avoid flooding the console
-        print(f"   - Result (length): {len(result):,}")
+        print(f"     - Result (length): {len(result):,}")
         result_str = str(len(result))
     else:
-        print(f"   - Result: None")
+        print(f"     - Result: None")
         result_str = "N/A"
         
-    # Standardized output (CSV format for easy parsing by benchmark tools)
-    # This format is compatible with the db-benchmark framework.
-    print(f"RESULT,Library={label},Task={task_name},Threads={threads},Time={duration:.4f},Result={result_str}")
+    # Standardized output for easy parsing
+    print(f"    RESULT,Library={label},Task={task_name},Threads={threads},Time={duration:.4f},Result={result_str}")
     return duration
 
+# --- Plotting Function ---
+def plot_results(results_df, task_name, output_filename="benchmark_results.png"):
+    """
+    Generates and saves a bar chart of the benchmark results for a specific task.
+    """
+    if plt is None or sns is None:
+        return # Skip plotting if libraries are not available
 
-# --- Main Execution Logic ---
+    # Filter data for the specific task (e.g., 'join_count')
+    task_df = results_df[results_df['task'] == task_name].copy()
+    
+    if task_df.empty:
+        print(f"\nNo data to plot for task: {task_name}")
+        return
+
+    # Sort implementations for consistent color ordering in the plot
+    # A custom order can make the plot more readable
+    impl_order = sorted(task_df['implementation'].unique())
+    
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig, ax = plt.subplots(figsize=(16, 9))
+    
+    sns.barplot(
+        data=task_df,
+        x='case',
+        y='time',
+        hue='implementation',
+        hue_order=impl_order,
+        ax=ax
+    )
+    
+    ax.set_title(f'Benchmark Performance: {task_name.replace("_", " ").title()}', fontsize=20, pad=20)
+    ax.set_xlabel('Benchmark Case (Dataset-Query)', fontsize=14)
+    ax.set_ylabel('Time (seconds)', fontsize=14)
+    ax.tick_params(axis='x', rotation=45, labelsize=12)
+    ax.tick_params(axis='y', labelsize=12)
+    ax.legend(title='Implementation', fontsize=12)
+    
+    # Add text labels on top of each bar
+    for container in ax.containers:
+        ax.bar_label(container, fmt='%.3f', fontsize=9, rotation=90, padding=5)
+
+    ax.margins(y=0.2) # Add some space at the top for the labels
+    fig.tight_layout()
+    
+    try:
+        fig.savefig(output_filename)
+        print(f"\n📊 Plot saved to '{output_filename}'")
+    except Exception as e:
+        print(f"\nError saving plot: {e}")
+        
+    plt.close(fig)
+
+# --- Main Logic ---
+
+def discover_benchmark_suites(data_dir):
+    """
+    Automatically discovers benchmark suites from the data directory.
+    """
+    print(f"Scanning for benchmark suites in: {data_dir}")
+    all_csv_files = glob.glob(os.path.join(data_dir, "J1_*.csv"))
+    
+    groups = defaultdict(list)
+    for f in all_csv_files:
+        basename = os.path.basename(f)
+        match = re.match(r"J1_(\de\d+)_", basename)
+        if match:
+            groups[match.group(1)].append(f)
+    
+    suites = []
+    for group_key, file_list in groups.items():
+        base_digit = group_key[0]
+        paths = {
+            'x': os.path.join(data_dir, f"J1_{group_key}_{group_key}_0_0.csv"),
+            'small': os.path.join(data_dir, f"J1_{group_key}_{base_digit}e1_0_0.csv"),
+            'medium': os.path.join(data_dir, f"J1_{group_key}_{base_digit}e4_0_0.csv"),
+            'big': os.path.join(data_dir, f"J1_{group_key}_{base_digit}e7_0_0.csv"),
+        }
+        
+        if all(os.path.exists(p) for p in paths.values()):
+            suite = paths.copy()
+            suite['group_name'] = group_key
+            suites.append(suite)
+            print(f"  - Found complete suite for data size '{group_key}'")
+        else:
+            print(f"  - WARNING: Incomplete file set for data size '{group_key}'. Skipping.")
+            
+    return suites
+
 def main():
-    parser = argparse.ArgumentParser(description="Run Join benchmarks for flash_join and DuckDB using h2oai/db-benchmark data.")
-    parser.add_argument("--path", type=str, required=True, help="Path to the data directory (e.g., './_data/join/N_1e8_K_10_P_5e8')")
-    parser.add_argument("--threads", type=int, default=os.cpu_count(), help="Number of threads to use for DuckDB.")
+    parser = argparse.ArgumentParser(description="Run and visualize a fair join benchmark suite.")
+    parser.add_argument("--data-dir", type=str, default='./data', help="Path to the directory containing the join benchmark CSV files.")
+    parser.add_argument("--threads", type=int, default=os.cpu_count(), help="Number of threads to use for all libraries.")
     args = parser.parse_args()
 
-    # --- 1. Load Data ---
-    print(f"Loading data from: {args.path}")
-    build_file = os.path.join(args.path, 'build.parquet')
-    probe_file = os.path.join(args.path, 'probe.parquet')
+    results_for_plotting = [] # List to store all benchmark results
 
-    if not os.path.exists(build_file) or not os.path.exists(probe_file):
-        print(f"Error: Parquet files not found in '{args.path}'.", file=sys.stderr)
-        print("Please generate the data first using `./run.sh datagen join` after configuring `run.conf`.", file=sys.stderr)
+    benchmark_suites = discover_benchmark_suites(args.data_dir)
+    if not benchmark_suites:
+        print("Error: No complete benchmark suites found.", file=sys.stderr)
         sys.exit(1)
 
-    # Load using pandas for easy conversion to NumPy arrays
-    build_df = pd.read_parquet(build_file)
-    probe_df = pd.read_parquet(probe_file)
-    
-    print(f"Build table size: {len(build_df):,} records")
-    print(f"Probe table size: {len(probe_df):,} records")
+    for suite in benchmark_suites:
+        print("=" * 80)
+        print(f"Loading data for suite '{suite['group_name']}'")
+        
+        tables_full = {name: pd.read_csv(path) for name, path in suite.items() if name != 'group_name'}
 
-    # --- CRITICAL: Data Type Conversion ---
-    # As noted in your original script, flash_join expects uint32.
-    # The benchmark framework generates Int64 by default, so this conversion is essential.
-    print("Converting data types to uint32 for flash_join compatibility...")
-    build_keys = build_df['key'].astype(np.uint32).to_numpy()
-    build_values = build_df['value'].astype(np.uint32).to_numpy()
-    probe_keys = probe_df['key'].astype(np.uint32).to_numpy()
-    print("Data loading and preparation complete.")
-    print("=" * 60)
+        benchmark_cases = [
+            {"id": "Q1", "desc": "INNER JOIN with 'small' table ON id1", "left": "x", "right": "small", "key": "id1"},
+            {"id": "Q2", "desc": "INNER JOIN with 'medium' table ON id2", "left": "x", "right": "medium", "key": "id2"},
+            {"id": "Q4", "desc": "INNER JOIN with 'medium' table ON id5 (factor key)", "left": "x", "right": "medium", "key": "id5"},
+            {"id": "Q5", "desc": "INNER JOIN with 'big' table ON id3", "left": "x", "right": "big", "key": "id3"},
+        ]
 
-    # --- 2. Run flash_join Benchmarks ---
-    # Note: The 'threads' parameter is passed for reporting consistency.
-    # The actual parallelism of flash_join is determined by its internal implementation.
-    run_benchmark("flash_join", "join", args.threads, 
-                  lambda: flash_join.hash_join(build_keys, build_values, probe_keys))
-    
-    run_benchmark("flash_join", "join_count", args.threads, 
-                  lambda: flash_join.hash_join_count(build_keys, build_values, probe_keys))
+        for case in benchmark_cases:
+            case_id = f"{suite['group_name']}-{case['id']}"
+            print("-" * 80)
+            print(f"▶️  Running Benchmark Case {case_id}: {case['desc']}")
+            print("-" * 80)
 
-    run_benchmark("flash_join_radix", "join", args.threads, 
-                  lambda: flash_join.hash_join_radix(build_keys, build_values, probe_keys))
-                  
-    run_benchmark("flash_join_radix", "join_count", args.threads, 
-                  lambda: flash_join.hash_join_count_radix(build_keys, build_values, probe_keys))
+            build_df_full = tables_full[case['right']]
+            probe_df_full = tables_full[case['left']]
+            join_key, value_col = case['key'], 'v2' 
 
-    run_benchmark("flash_join_scalar", "join", args.threads, 
-                  lambda: flash_join.hash_join_scalar(build_keys, build_values, probe_keys))
+            if join_key not in build_df_full.columns or join_key not in probe_df_full.columns or value_col not in build_df_full.columns:
+                print(f"  - WARNING: Required columns not found. Skipping case.")
+                continue
 
-    run_benchmark("flash_join_scalar", "join_count", args.threads, 
-                  lambda: flash_join.hash_join_count_scalar(build_keys, build_values, probe_keys))
+            is_key_numeric = ptypes.is_numeric_dtype(build_df_full[join_key]) and ptypes.is_numeric_dtype(probe_df_full[join_key])
+            is_value_numeric = ptypes.is_numeric_dtype(build_df_full[value_col])
+            
+            if not (is_key_numeric and is_value_numeric):
+                print(f"  - WARNING: Key or value column is not purely numeric. Skipping case.")
+                continue
+            
+            build_df = build_df_full[[join_key, value_col]].rename(columns={join_key: 'key', value_col: 'value'})
+            probe_df = probe_df_full[[join_key]].rename(columns={join_key: 'key'})
+            
+            build_df['key'], build_df['value'], probe_df['key'] = \
+                build_df['key'].astype(np.uint64), build_df['value'].astype(np.uint64), probe_df['key'].astype(np.uint64)
+            
+            build_keys, build_values, probe_keys = \
+                build_df['key'].to_numpy(), build_df['value'].to_numpy(), probe_df['key'].to_numpy()
+            
+            # --- flash_join Benchmarks ---
+            impl_map = {
+                'flash_join': (flash_join.hash_join_count, flash_join.hash_join),
+                'flash_join_radix': (flash_join.hash_join_count_radix, flash_join.hash_join_radix),
+                'flash_join_scalar': (flash_join.hash_join_count_scalar, flash_join.hash_join_scalar),
+            }
+            for label, (count_func, mat_func) in impl_map.items():
+                duration_count = run_benchmark(label, "join_count", args.threads, lambda: count_func(build_keys, build_values, probe_keys))
+                results_for_plotting.append({'case': case_id, 'implementation': label, 'task': 'join_count', 'time': duration_count})
+                
+                duration_mat = run_benchmark(label, "join_materialize", args.threads, lambda: mat_func(build_keys, build_values, probe_keys))
+                results_for_plotting.append({'case': case_id, 'implementation': label, 'task': 'join_materialize', 'time': duration_mat})
+
+            # --- DuckDB Benchmarks ---
+            # ... (DuckDB logic remains the same) ...
+            con = duckdb.connect(database=':memory:')
+            con.execute(f"PRAGMA THREADS={args.threads}")
+
+            start_ingest = time.perf_counter()
+            con.execute("CREATE TABLE build_native AS SELECT * FROM build_df;")
+            con.execute("CREATE TABLE probe_native AS SELECT * FROM probe_df;")
+            duration_ingest = time.perf_counter() - start_ingest
+            
+            duration_join_count = run_benchmark("duckdb", "join_count", args.threads, 
+                                                lambda: con.execute("SELECT count(*) FROM build_native b JOIN probe_native p ON b.key = p.key;").fetchone()[0])
+            
+            def duckdb_materialize_and_count():
+                con.execute("CREATE OR REPLACE TEMPORARY TABLE temp AS SELECT p.key, b.value FROM build_native b JOIN probe_native p ON b.key = p.key;")
+                return con.execute("SELECT count(*) FROM temp").fetchone()[0]
+            duration_join_materialize = run_benchmark("duckdb", "join_materialize", args.threads, duckdb_materialize_and_count)
+            con.close()
+
+            # Add DuckDB results to plotting data
+            results_for_plotting.append({'case': case_id, 'implementation': 'duckdb (Join Only)', 'task': 'join_count', 'time': duration_join_count})
+            results_for_plotting.append({'case': case_id, 'implementation': 'duckdb (Ingest + Join)', 'task': 'join_count', 'time': duration_ingest + duration_join_count})
+            results_for_plotting.append({'case': case_id, 'implementation': 'duckdb (Join Only)', 'task': 'join_materialize', 'time': duration_join_materialize})
+            results_for_plotting.append({'case': case_id, 'implementation': 'duckdb (Ingest + Join)', 'task': 'join_materialize', 'time': duration_ingest + duration_join_materialize})
 
 
-    # --- 3. Run DuckDB Benchmarks ---
-    print("=" * 60)
-    print(f"Configuring DuckDB to use {args.threads} threads...")
-    con = duckdb.connect(database=':memory:')
-    con.execute(f"PRAGMA THREADS={args.threads}")
-    con.execute(f"PRAGMA-SET-VERIFY-EXTERNAL=true") # Recommended when reading from external files
+    print("\n" + "="*80)
+    print("All benchmark cases finished.")
+    print("="*80)
 
-    # DuckDB - Join Count
-    # This is the standard db-benchmark way: read directly from Parquet files.
-    query_count = f"""
-    SELECT COUNT(*) 
-    FROM read_parquet('{probe_file}') AS p 
-    JOIN read_parquet('{build_file}') AS b ON p.key = b.key;
-    """
-    run_benchmark("duckdb", "join_count", args.threads, 
-                  lambda: con.execute(query_count).fetchone()[0])
-
-    # DuckDB - Join and Materialize Result
-    # This simulates a scenario where all matching rows need to be returned.
-    query_materialize = f"""
-    SELECT b.value
-    FROM read_parquet('{probe_file}') AS p 
-    JOIN read_parquet('{build_file}') AS b ON p.key = b.key;
-    """
-    # We get the length of the result, not the full result set itself, to avoid memory issues and slow printing.
-    run_benchmark("duckdb", "join", args.threads, 
-                  lambda: len(con.execute(query_materialize).fetchall()))
-                  
-    con.close()
-    
-    print("\n" + "="*60)
-    print("Benchmark run finished.")
-    print("="*60)
-
+    # --- Final Step: Generate Plots ---
+    if results_for_plotting:
+        results_df = pd.DataFrame(results_for_plotting)
+        plot_results(results_df, 'join_count', 'benchmark_join_count.png')
+        plot_results(results_df, 'join_materialize', 'benchmark_join_materialize.png')
 
 if __name__ == "__main__":
     main()
