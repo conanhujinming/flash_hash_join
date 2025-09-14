@@ -37,13 +37,11 @@ namespace py = pybind11;
 // ==========================================================================================
 constexpr size_t RADIX_BITS = 8;
 constexpr size_t NUM_PARTITIONS = 1 << RADIX_BITS;
-
 uint64_t hash64(uint64_t key, uint32_t seed) {
     uint64_t k = 0x8648DBDB;
     uint64_t crc = _mm_crc32_u64(seed, key);
     return crc * ((k << 32) + 1);
 }
-
 class SimpleTimer {
 public:
     SimpleTimer() : start_time_(std::chrono::high_resolution_clock::now()) {}
@@ -55,12 +53,10 @@ public:
 private:
     std::chrono::time_point<std::chrono::high_resolution_clock> start_time_;
 };
-
 template<typename KeyType>
 struct Hasher {
     uint64_t operator()(const KeyType& key) const { return hash64(key, 0xAAAAAAAA); }
 };
-
 namespace internal {
     constexpr size_t TAGS_TABLE_SIZE = 1 << 11;
     constexpr auto create_tags_table() {
@@ -76,7 +72,6 @@ namespace internal {
         return table;
     }
 }
-
 template<bool UseBloomFilter = false>
 class FlashHashTable {
 public:
@@ -88,6 +83,7 @@ private:
         uint64_t key;
         uint64_t value;
     };
+
     std::unique_ptr<Slot[]> slots_;
     std::unique_ptr<std::atomic<uint16_t>[]> bloom_directory_;
     size_t capacity_;
@@ -184,7 +180,6 @@ public:
         }
         return match_count;
     }
-
     inline uint16_t get_bloom_tag(uint64_t hash) const { return tags_table_[(static_cast<uint32_t>(hash)) >> (32 - 11)]; }
 
     inline bool check_bloom_filter(uint64_t hash) const {
@@ -194,7 +189,7 @@ public:
     }
 
     void build_local(const uint64_t* keys, const uint64_t* values, size_t size) { for (size_t i = 0; i < size; ++i) { this->insert_local(keys[i], values[i]); } }
-    
+
     void build_concurrent(const uint64_t* keys, const uint64_t* values, size_t size) {
         size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
         size_t work_per_thread = (size + num_threads - 1) / num_threads;
@@ -297,7 +292,7 @@ parallel_radix_partition_k(const uint64_t* keys, size_t size, size_t num_threads
 }
 
 // ==========================================================================================
-// SECTION 3 & 4: FINALIZED HYBRID JOIN FUNCTIONS & PYBIND MODULE
+// SECTION 3: UNDERLYING JOIN IMPLEMENTATIONS
 // ==========================================================================================
 #if defined(__cpp_lib_hardware_interference_size)
     constexpr size_t CACHE_LINE_SIZE = std::hardware_destructive_interference_size;
@@ -306,6 +301,16 @@ parallel_radix_partition_k(const uint64_t* keys, size_t size, size_t num_threads
 #endif
 constexpr size_t PROBE_BATCH_SIZE = 2048;
 struct alignas(CACHE_LINE_SIZE) PaddedCounter { std::atomic<size_t> value{0}; };
+
+
+template <typename HashTableType>
+py::tuple _hash_join_radix_materialize(py::array_t<uint64_t> b_k, py::array_t<uint64_t> b_v, py::array_t<uint64_t> p_k);
+template<typename HashTableType>
+py::tuple _hash_join_scalar_materialize(py::array_t<uint64_t> b_k, py::array_t<uint64_t> b_v, py::array_t<uint64_t> p_k);
+template <typename HashTableType>
+py::tuple _hash_join_radix_count(py::array_t<uint64_t> b_k, py::array_t<uint64_t> b_v, py::array_t<uint64_t> p_k);
+template<typename HashTableType>
+py::tuple _hash_join_scalar_count(py::array_t<uint64_t> b_k, py::array_t<uint64_t> b_v, py::array_t<uint64_t> p_k);
 
 template <typename HashTableType>
 py::tuple _hash_join_radix_materialize(py::array_t<uint64_t> b_k, py::array_t<uint64_t> b_v, py::array_t<uint64_t> p_k) {
@@ -382,19 +387,11 @@ py::tuple _hash_join_scalar_materialize(py::array_t<uint64_t> b_k, py::array_t<u
     size_t probe_size = p_k_buf.size;
     size_t build_size = b_k_buf.size;
     size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
-    
     SimpleTimer timer;
-    
     HashTableType ht(build_size);
     ht.build_concurrent(static_cast<uint64_t*>(b_k_buf.ptr), static_cast<uint64_t*>(b_v_buf.ptr), build_size);
-
-    // --- HYBRID STRATEGY ---
-    // Heuristic: If build table is small, it fits in L3 cache. The two-pass
-    // method is faster as it avoids an extra memory copy of the results.
     constexpr size_t SMALL_TABLE_THRESHOLD = 500'000;
-
     if (build_size <= SMALL_TABLE_THRESHOLD) {
-        // --- PATH 1: Small Table (Two-Pass, Cache-Hot Re-Probe) ---
         std::vector<PaddedCounter> counts_per_thread(num_threads);
         std::vector<std::thread> threads;
         size_t work_per_thread = (probe_size + num_threads - 1) / num_threads;
@@ -445,10 +442,7 @@ py::tuple _hash_join_scalar_materialize(py::array_t<uint64_t> b_k, py::array_t<u
         for (auto& t : threads) { t.join(); }
         double core_duration_sec = timer.elapsed_seconds();
         return py::make_tuple(py::int_(total_results), core_duration_sec);
-
     } else {
-        // --- PATH 2: Large Table (Single-Pass with Local Buffers) ---
-        // This avoids a costly memory-bound re-probe.
         std::vector<std::vector<uint64_t>> local_result_keys(num_threads);
         std::vector<std::vector<uint64_t>> local_result_values(num_threads);
         std::vector<std::thread> threads;
@@ -572,18 +566,75 @@ py::tuple _hash_join_scalar_count(py::array_t<uint64_t> b_k, py::array_t<uint64_
     return py::make_tuple(py::int_(total_results), core_duration_sec);
 }
 
+
+// ==========================================================================================
+// SECTION 4: NEW ADAPTIVE JOIN DISPATCHER & PYBIND MODULE
+// ==========================================================================================
+
+// This threshold determines when to switch from a single global hash table (scalar)
+// to a partitioned approach (radix). 1M rows is a reasonable starting point.
+constexpr size_t RADIX_JOIN_THRESHOLD = 1'000'000;
+
+template <typename HashTableType>
+py::tuple adaptive_hash_join_materialize(py::array_t<uint64_t> b_k, py::array_t<uint64_t> b_v, py::array_t<uint64_t> p_k) {
+    if (b_k.request().size < RADIX_JOIN_THRESHOLD) {
+        return _hash_join_scalar_materialize<HashTableType>(b_k, b_v, p_k);
+    } else {
+        return _hash_join_radix_materialize<HashTableType>(b_k, b_v, p_k);
+    }
+}
+
+template <typename HashTableType>
+py::tuple adaptive_hash_join_count(py::array_t<uint64_t> b_k, py::array_t<uint64_t> b_v, py::array_t<uint64_t> p_k) {
+    if (b_k.request().size < RADIX_JOIN_THRESHOLD) {
+        return _hash_join_scalar_count<HashTableType>(b_k, b_v, p_k);
+    } else {
+        return _hash_join_radix_count<HashTableType>(b_k, b_v, p_k);
+    }
+}
+
 void initialize_memory_system() { mi_version(); }
 
 PYBIND11_MODULE(flash_join, m) {
     initialize_memory_system();
-    m.doc() = "A high-performance hash join with micro-architectural optimizations"; 
-    m.def("hash_join_radix", &_hash_join_radix_materialize<FlashHashTable<false>>, "", py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
-    m.def("hash_join", &_hash_join_scalar_materialize<FlashHashTable<false>>, "", py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
+    m.doc() = "A high-performance hash join library with adaptive and explicit strategies."; 
+
+    // --- NEW: Adaptive, user-facing API ---
+    m.def("adaptive_join", &adaptive_hash_join_materialize<FlashHashTable<false>>, 
+        "Adaptively chooses between scalar and radix join for materialization.", 
+        py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
+    
+    m.def("adaptive_join_bloom", &adaptive_hash_join_materialize<FlashHashTable<true>>, 
+        "Adaptive join with bloom filter for materialization.", 
+        py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
+
+    m.def("adaptive_join_count", &adaptive_hash_join_count<FlashHashTable<false>>, 
+        "Adaptively chooses between scalar and radix join for counting.", 
+        py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
+
+    m.def("adaptive_join_count_bloom", &adaptive_hash_join_count<FlashHashTable<true>>, 
+        "Adaptive join with bloom filter for counting.", 
+        py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
+
+
+    // --- OLD: Explicit APIs for benchmarking and fine-grained control ---
+    m.def("hash_join_radix", &_hash_join_radix_materialize<FlashHashTable<false>>, 
+        "Forces the use of radix join for materialization.",
+        py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
+    m.def("hash_join", &_hash_join_scalar_materialize<FlashHashTable<false>>, 
+        "Forces the use of scalar (non-partitioned) join for materialization.",
+        py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
     m.def("hash_join_radix_bloom", &_hash_join_radix_materialize<FlashHashTable<true>>, "", py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
     m.def("hash_join_bloom", &_hash_join_scalar_materialize<FlashHashTable<true>>, "", py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
-    m.def("hash_join_count_radix", &_hash_join_radix_count<FlashHashTable<false>>, "", py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
-    m.def("hash_join_count", &_hash_join_scalar_count<FlashHashTable<false>>, "", py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
+    
+    m.def("hash_join_count_radix", &_hash_join_radix_count<FlashHashTable<false>>, 
+        "Forces the use of radix join for counting.",
+        py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
+    m.def("hash_join_count", &_hash_join_scalar_count<FlashHashTable<false>>, 
+        "Forces the use of scalar (non-partitioned) join for counting.",
+        py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
     m.def("hash_join_count_radix_bloom", &_hash_join_radix_count<FlashHashTable<true>>, "", py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
     m.def("hash_join_count_bloom", &_hash_join_scalar_count<FlashHashTable<true>>, "", py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
+    
     m.def("initialize", &initialize_memory_system, "Initializes the custom memory allocator.");
 }

@@ -238,6 +238,8 @@ def main():
             
             # --- flash_join Benchmarks ---
             impl_map = {
+                'adaptive_join': (flash_join.adaptive_join_count, flash_join.adaptive_join),
+                'adaptive_bloom': (flash_join.adaptive_join_count_bloom, flash_join.adaptive_join_bloom),
                 'flash_join': (flash_join.hash_join_count, flash_join.hash_join),
                 'flash_join_radix': (flash_join.hash_join_count_radix, flash_join.hash_join_radix),
                 'flash_join_bloom': (flash_join.hash_join_count_bloom, flash_join.hash_join_bloom),
