@@ -64,7 +64,7 @@ def run_benchmark(label, task_name, threads, func):
         result_str = str(result)
     elif result is not None:
         print(f"     - Result (length): {len(result):,}")
-        result_str = str(len(result))
+        result_str = str(len(result[0]))
     else:
         print(f"     - Result: None")
         result_str = "N/A"
@@ -222,7 +222,8 @@ def main():
             impl_map = {
                 'flash_join': (flash_join.hash_join_count, flash_join.hash_join),
                 'flash_join_radix': (flash_join.hash_join_count_radix, flash_join.hash_join_radix),
-                'flash_join_scalar': (flash_join.hash_join_count_scalar, flash_join.hash_join_scalar),
+                'flash_join_bloom': (flash_join.hash_join_count_bloom, flash_join.hash_join_bloom),
+                'flash_join_radix_bloom': (flash_join.hash_join_count_radix_bloom, flash_join.hash_join_radix_bloom),
             }
             for label, (count_func, mat_func) in impl_map.items():
                 duration_count = run_benchmark(label, "join_count", args.threads, lambda: count_func(build_keys, build_values, probe_keys))
