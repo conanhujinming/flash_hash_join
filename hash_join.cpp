@@ -32,15 +32,15 @@
 
 namespace py = pybind11;
 
-uint64_t hash32(uint32_t key, uint32_t seed) {
+uint64_t hash64(uint64_t key, uint32_t seed) {
     uint64_t k = 0x8648DBDB;          // Mixing constant
-    uint32_t crc = _mm_crc32_u32(seed, key);   // crc32
+    uint64_t crc = _mm_crc32_u64(seed, key);   // crc32
     return crc * ((k << 32) + 1); // imul
 }
 
 template<typename KeyType>
 struct Hasher {
-    uint64_t operator()(const KeyType& key) const { return hash32(key, 0xAAAAAAAA); }
+    uint64_t operator()(const KeyType& key) const { return hash64(key, 0xAAAAAAAA); }
 };
 
 struct alignas(64) PaddedCounter {
@@ -413,13 +413,13 @@ public:
     }
 };
 
-using HT = UnchainedHashTable<uint32_t, uint32_t>;
+using HT = UnchainedHashTable<uint64_t, uint64_t>;
 
 // --- Public Functions and Passes ---
 // (The following code remains unchanged as it depends on the HT class interface, not its implementation)
 
 std::pair<size_t, std::vector<size_t>>
-count_scalar_pass(const HT& ht, const uint32_t* probe_keys_ptr, size_t probe_size, size_t num_threads) {
+count_scalar_pass(const HT& ht, const uint64_t* probe_keys_ptr, size_t probe_size, size_t num_threads) {
     std::vector<std::thread> threads;
     size_t work_per_thread = (probe_size + num_threads - 1) / num_threads;
     std::vector<PaddedCounter> counts(num_threads);
@@ -450,7 +450,7 @@ count_scalar_pass(const HT& ht, const uint32_t* probe_keys_ptr, size_t probe_siz
 
 
 std::pair<size_t, std::vector<size_t>>
-count_batch_pass(const HT& ht, const uint32_t* probe_keys_ptr, size_t probe_size, size_t num_threads) {
+count_batch_pass(const HT& ht, const uint64_t* probe_keys_ptr, size_t probe_size, size_t num_threads) {
     std::vector<std::thread> threads;
     size_t work_per_thread = (probe_size + num_threads - 1) / num_threads;
     std::vector<PaddedCounter> counts(num_threads);
@@ -476,45 +476,45 @@ count_batch_pass(const HT& ht, const uint32_t* probe_keys_ptr, size_t probe_size
     return {total_results, offsets};
 }
 
-py::int_ hash_join_count_scalar(py::array_t<uint32_t> build_keys,
-                                py::array_t<uint32_t> build_values,
-                                py::array_t<uint32_t> probe_keys) {
+py::int_ hash_join_count_scalar(py::array_t<uint64_t> build_keys,
+                                py::array_t<uint64_t> build_values,
+                                py::array_t<uint64_t> probe_keys) {
     py::buffer_info build_keys_buf = build_keys.request();
     py::buffer_info build_values_buf = build_values.request();
     py::buffer_info probe_keys_buf = probe_keys.request();
 
     HT ht(build_keys_buf.size, build_keys_buf.size);
-    ht.build(static_cast<uint32_t*>(build_keys_buf.ptr),
-             static_cast<uint32_t*>(build_values_buf.ptr),
+    ht.build(static_cast<uint64_t*>(build_keys_buf.ptr),
+             static_cast<uint64_t*>(build_values_buf.ptr),
              build_keys_buf.size);
 
     size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
     std::cout << "num_threads = " << num_threads << std::endl;
-    auto [total_results, offsets] = count_scalar_pass(ht, static_cast<uint32_t*>(probe_keys_buf.ptr), probe_keys_buf.size, num_threads);
+    auto [total_results, offsets] = count_scalar_pass(ht, static_cast<uint64_t*>(probe_keys_buf.ptr), probe_keys_buf.size, num_threads);
     
     return py::int_(total_results);
 }
 
-py::tuple hash_join_scalar(py::array_t<uint32_t> build_keys,
-                           py::array_t<uint32_t> build_values,
-                           py::array_t<uint32_t> probe_keys) {
+py::tuple hash_join_scalar(py::array_t<uint64_t> build_keys,
+                           py::array_t<uint64_t> build_values,
+                           py::array_t<uint64_t> probe_keys) {
     py::buffer_info build_keys_buf = build_keys.request();
     py::buffer_info probe_keys_buf = probe_keys.request();
-    const uint32_t* probe_keys_ptr = static_cast<uint32_t*>(probe_keys_buf.ptr);
+    const uint64_t* probe_keys_ptr = static_cast<uint64_t*>(probe_keys_buf.ptr);
     size_t probe_size = probe_keys_buf.size;
 
     HT ht(build_keys_buf.size, build_keys_buf.size);
-    ht.build(static_cast<uint32_t*>(build_keys_buf.ptr),
-             static_cast<uint32_t*>(build_values.request().ptr),
+    ht.build(static_cast<uint64_t*>(build_keys_buf.ptr),
+             static_cast<uint64_t*>(build_values.request().ptr),
              build_keys_buf.size);
 
     size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
     auto [total_results, offsets] = count_scalar_pass(ht, probe_keys_ptr, probe_size, num_threads);
 
-    py::array_t<uint32_t> result_keys(total_results);
-    py::array_t<uint32_t> result_values(total_results);
-    uint32_t* result_keys_ptr = static_cast<uint32_t*>(result_keys.request().ptr);
-    uint32_t* result_values_ptr = static_cast<uint32_t*>(result_values.request().ptr);
+    py::array_t<uint64_t> result_keys(total_results);
+    py::array_t<uint64_t> result_values(total_results);
+    uint64_t* result_keys_ptr = static_cast<uint64_t*>(result_keys.request().ptr);
+    uint64_t* result_values_ptr = static_cast<uint64_t*>(result_values.request().ptr);
 
     std::vector<std::thread> threads;
     size_t work_per_thread = (probe_size + num_threads - 1) / num_threads;
@@ -543,48 +543,48 @@ py::tuple hash_join_scalar(py::array_t<uint32_t> build_keys,
 }
 
 
-py::int_ hash_join_count_batch(py::array_t<uint32_t> build_keys,
-                               py::array_t<uint32_t> build_values,
-                               py::array_t<uint32_t> probe_keys) {
+py::int_ hash_join_count_batch(py::array_t<uint64_t> build_keys,
+                               py::array_t<uint64_t> build_values,
+                               py::array_t<uint64_t> probe_keys) {
     py::buffer_info build_keys_buf = build_keys.request();
     py::buffer_info build_values_buf = build_values.request();
     py::buffer_info probe_keys_buf = probe_keys.request();
 
     HT ht(build_keys_buf.size, build_keys_buf.size);
-    ht.build(static_cast<uint32_t*>(build_keys_buf.ptr),
-             static_cast<uint32_t*>(build_values_buf.ptr),
+    ht.build(static_cast<uint64_t*>(build_keys_buf.ptr),
+             static_cast<uint64_t*>(build_values_buf.ptr),
              build_keys_buf.size);
 
     size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
     std::cout << "num_threads = " << num_threads << std::endl;
-    auto [total_results, offsets] = count_batch_pass(ht, static_cast<uint32_t*>(probe_keys_buf.ptr), probe_keys_buf.size, num_threads);
+    auto [total_results, offsets] = count_batch_pass(ht, static_cast<uint64_t*>(probe_keys_buf.ptr), probe_keys_buf.size, num_threads);
 
     return py::int_(total_results);
 }
 
 
-py::tuple hash_join_batch(py::array_t<uint32_t> build_keys,
-                          py::array_t<uint32_t> build_values,
-                          py::array_t<uint32_t> probe_keys) {
+py::tuple hash_join_batch(py::array_t<uint64_t> build_keys,
+                          py::array_t<uint64_t> build_values,
+                          py::array_t<uint64_t> probe_keys) {
     py::buffer_info build_keys_buf = build_keys.request();
     py::buffer_info build_values_buf = build_values.request();
     py::buffer_info probe_keys_buf = probe_keys.request();
-    const uint32_t* probe_keys_ptr = static_cast<uint32_t*>(probe_keys_buf.ptr);
+    const uint64_t* probe_keys_ptr = static_cast<uint64_t*>(probe_keys_buf.ptr);
     size_t probe_size = probe_keys_buf.size;
 
     HT ht(build_keys_buf.size, build_keys_buf.size);
-    ht.build(static_cast<uint32_t*>(build_keys_buf.ptr),
-             static_cast<uint32_t*>(build_values_buf.ptr),
+    ht.build(static_cast<uint64_t*>(build_keys_buf.ptr),
+             static_cast<uint64_t*>(build_values_buf.ptr),
              build_keys_buf.size);
 
     size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
     std::cout << "num_threads = " << num_threads << std::endl;
     auto [total_results, offsets] = count_batch_pass(ht, probe_keys_ptr, probe_size, num_threads);
 
-    py::array_t<uint32_t> result_keys(total_results);
-    py::array_t<uint32_t> result_values(total_results);
-    uint32_t* result_keys_ptr = static_cast<uint32_t*>(result_keys.request().ptr);
-    uint32_t* result_values_ptr = static_cast<uint32_t*>(result_values.request().ptr);
+    py::array_t<uint64_t> result_keys(total_results);
+    py::array_t<uint64_t> result_values(total_results);
+    uint64_t* result_keys_ptr = static_cast<uint64_t*>(result_keys.request().ptr);
+    uint64_t* result_values_ptr = static_cast<uint64_t*>(result_values.request().ptr);
 
     std::vector<std::thread> threads;
     size_t work_per_thread = (probe_size + num_threads - 1) / num_threads;

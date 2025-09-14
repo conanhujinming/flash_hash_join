@@ -45,9 +45,9 @@ def generate_data(build_size, probe_size):
     print("Generating test data...")
     key_cardinality = build_size // 10
     # Fix data type - use uint32 instead of uint64 to match C++ extension
-    build_keys = np.random.randint(0, key_cardinality, size=build_size, dtype=np.uint32)
-    build_values = np.arange(build_size, dtype=np.uint32)
-    probe_keys = np.random.randint(0, key_cardinality * 2, size=probe_size, dtype=np.uint32)
+    build_keys = np.random.randint(0, key_cardinality, size=build_size)
+    build_values = np.arange(build_size)
+    probe_keys = np.random.randint(0, key_cardinality * 2, size=probe_size)
     print(f"Build table size: {len(build_keys):,} records")
     print(f"Probe table size: {len(probe_keys):,} records")
     print("Data generation complete.")
@@ -70,18 +70,6 @@ if __name__ == "__main__":
     # --- 1. Benchmark our C++ (flash_join) ---
     print("\n🚀 Starting benchmark for C++ (flash_join) [End-to-End]...")
 
-    print("Testing flash_join.hash_join_count...")
-    start_time_cpp = time.perf_counter()
-    try:
-        cpp_count = flash_join.hash_join_count(build_keys, build_values, probe_keys)
-        end_time_cpp = time.perf_counter()
-        duration_cpp = end_time_cpp - start_time_cpp
-        print(f"C++ (flash_join_count) finished in: {duration_cpp:.4f} seconds")
-        print(f"Result count: {cpp_count}")
-    except Exception as e:
-        print(f"Error in flash_join.hash_join_count: {e}")
-        sys.exit(1)
-
     print("Testing flash_join.hash_join...")
     start_time_cpp = time.perf_counter()
     try:
@@ -94,18 +82,30 @@ if __name__ == "__main__":
         print(f"Error in flash_join.hash_join: {e}")
         sys.exit(1)
 
-    print("\n🚀 Starting benchmark for C++ (flash_join_scalar) [End-to-End]...")
+    print("Testing flash_join.hash_join_count...")
     start_time_cpp = time.perf_counter()
-    cpp_count = flash_join.hash_join_count_scalar(build_keys, build_values, probe_keys)
-    end_time_cpp = time.perf_counter()
-    duration_cpp = end_time_cpp - start_time_cpp
-    print(f"C++ (flash_join_count_scalar) finished in: {duration_cpp:.4f} seconds")
+    try:
+        cpp_count = flash_join.hash_join_count(build_keys, build_values, probe_keys)
+        end_time_cpp = time.perf_counter()
+        duration_cpp = end_time_cpp - start_time_cpp
+        print(f"C++ (flash_join_count) finished in: {duration_cpp:.4f} seconds")
+        print(f"Result count: {cpp_count}")
+    except Exception as e:
+        print(f"Error in flash_join.hash_join_count: {e}")
+        sys.exit(1)
 
     start_time_cpp = time.perf_counter()
     cpp_count = flash_join.hash_join_scalar(build_keys, build_values, probe_keys)
     end_time_cpp = time.perf_counter()
     duration_cpp = end_time_cpp - start_time_cpp
     print(f"C++ (flash_join_scalar) finished in: {duration_cpp:.4f} seconds")
+
+    print("\n🚀 Starting benchmark for C++ (flash_join_scalar) [End-to-End]...")
+    start_time_cpp = time.perf_counter()
+    cpp_count = flash_join.hash_join_count_scalar(build_keys, build_values, probe_keys)
+    end_time_cpp = time.perf_counter()
+    duration_cpp = end_time_cpp - start_time_cpp
+    print(f"C++ (flash_join_count_scalar) finished in: {duration_cpp:.4f} seconds")
 
     build_file = 'build.parquet'
     probe_file = 'probe.parquet'
@@ -145,20 +145,34 @@ if __name__ == "__main__":
     start_join = time.perf_counter()
     # This query now runs entirely on DuckDB's internal, parallel-friendly format
     query = "SELECT count(*) FROM probe_native AS p JOIN build_native AS b ON p.key = b.key"
-    duckdb_result = con.execute(query).df()
+    duckdb_result = con.execute(query).arrow()
+    end_join = time.perf_counter()
+    duration_join_count = end_join - start_join
+    print(f"  - DuckDB native join count finished in: {duration_join_count:.4f} seconds")
+    
+    duration_duckdb_total_count = duration_ingest + duration_join_count
+    print(f"DuckDB (Total Ingest + Join count) finished in: {duration_duckdb_total_count:.4f} seconds, count: {duckdb_result}")
+
+
+    start_join = time.perf_counter()
+    # This query now runs entirely on DuckDB's internal, parallel-friendly format
+    query = "SELECT * FROM probe_native AS p JOIN build_native AS b ON p.key = b.key"
+    duckdb_result = con.execute(query).arrow()
     end_join = time.perf_counter()
     duration_join = end_join - start_join
-    print(f"  - DuckDB native join finished in: {duration_join:.4f} seconds")
+    print(f"  - DuckDB native join finished in: {duration_join_count:.4f} seconds")
     
     duration_duckdb_total = duration_ingest + duration_join
-    print(f"DuckDB (Total Ingest + Join) finished in: {duration_duckdb_total:.4f} seconds, count: {duckdb_result.iloc[0,0]}")
+    print(f"DuckDB (Total Ingest + Join) finished in: {duration_duckdb_total:.4f} seconds, count: {len(duckdb_result)}")
     
     # --- Results Summary ---
     print("\n" + "="*40)
     print("📊 Final Performance Summary (End-to-End)")
     print(f"Our C++ (Build + Probe):  {duration_cpp:.4f} seconds")
-    print(f"DuckDB (Ingest + Join):   {duration_duckdb_total:.4f} seconds")
+    print(f"DuckDB (Ingest + Join count):   {duration_duckdb_total_count:.4f} seconds")
     print(f"  - DuckDB Ingest phase:    ({duration_ingest:.4f}s)")
+    print(f"  - DuckDB Join count phase:      ({duration_join_count:.4f}s)")
+    print(f"DuckDB (Ingest + Join):   {duration_duckdb_total:.4f} seconds")
     print(f"  - DuckDB Join phase:      ({duration_join:.4f}s)")
     # print(f"Pandas (pd.merge):        {duration_pandas:.4f} seconds")
     print("-" * 40)
