@@ -22,8 +22,9 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
-#define MI_OVERRIDE 0
-#define MI_MANUAL_INIT 1
+// Re-enable mimalloc with proper configuration
+#define MI_OVERRIDE 0  // Don't override system malloc
+#define MI_MALLOC_OVERRIDE 0  // Don't override malloc
 #include <mimalloc.h>
 
 namespace py = pybind11;
@@ -45,7 +46,7 @@ struct alignas(64) PaddedCounter {
 
 struct MimallocDeleter {
     void operator()(void* ptr) const {
-        mi_free(ptr);
+        if (ptr) mi_free(ptr);
     }
 };
 
@@ -410,6 +411,7 @@ py::int_ hash_join_count_scalar(py::array_t<uint32_t> build_keys,
              build_keys_buf.size);
 
     size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
+    std::cout << "num_threads = " << num_threads << std::endl;
     auto [total_results, offsets] = count_scalar_pass(ht, static_cast<uint32_t*>(probe_keys_buf.ptr), probe_keys_buf.size, num_threads);
     
     return py::int_(total_results);
@@ -430,6 +432,7 @@ py::tuple hash_join_scalar(py::array_t<uint32_t> build_keys,
              build_keys_buf.size);
 
     size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
+    std::cout << "num_threads = " << num_threads << std::endl;
     auto [total_results, offsets] = count_scalar_pass(ht, probe_keys_ptr, probe_size, num_threads);
 
     py::array_t<uint32_t> result_keys(total_results);
@@ -476,6 +479,7 @@ py::int_ hash_join_count_batch(py::array_t<uint32_t> build_keys,
              build_keys_buf.size);
 
     size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
+    std::cout << "num_threads = " << num_threads << std::endl;
     auto [total_results, offsets] = count_batch_pass(ht, static_cast<uint32_t*>(probe_keys_buf.ptr), probe_keys_buf.size, num_threads);
 
     return py::int_(total_results);
@@ -497,6 +501,7 @@ py::tuple hash_join_batch(py::array_t<uint32_t> build_keys,
              build_keys_buf.size);
 
     size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
+    std::cout << "num_threads = " << num_threads << std::endl;
     auto [total_results, offsets] = count_batch_pass(ht, probe_keys_ptr, probe_size, num_threads);
 
     py::array_t<uint32_t> result_keys(total_results);
@@ -522,7 +527,10 @@ py::tuple hash_join_batch(py::array_t<uint32_t> build_keys,
 }
 
 void initialize_memory_system() {
-    mi_process_init();
+    // Initialize mimalloc without overriding system malloc
+    // This allows coexistence with numpy/pandas memory allocators
+    mi_version();  // Simple call to ensure mimalloc is initialized
+    return;
 }
 
 PYBIND11_MODULE(flash_join, m) {

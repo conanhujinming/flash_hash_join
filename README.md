@@ -50,7 +50,7 @@ To replicate the performance tests, you can run the provided Python benchmark sc
 
 ```bash
 # From the project root directory
-pip install -e .
+python3 setup.py build_ext --inplace
 python benchmark.py
 ```
 
