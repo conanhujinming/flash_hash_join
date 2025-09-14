@@ -1,1 +1,4 @@
 *.parquet
+build
+*.csv
+*.so

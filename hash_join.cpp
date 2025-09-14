@@ -10,6 +10,7 @@
 #include <numeric>
 #include <algorithm> // For std::sort
 #include <random>
+#include <tuple>
 
 // AVX2 and other intrinsics
 #if defined(__AVX2__)
@@ -31,6 +32,13 @@
 #include <mimalloc.h>
 
 namespace py = pybind11;
+
+// --- Constants for Radix Partitioning ---
+// The number of bits to use for partitioning. 8 bits = 256 partitions.
+constexpr size_t RADIX_BITS = 8;
+// The total number of partitions.
+constexpr size_t NUM_PARTITIONS = 1 << RADIX_BITS;
+
 
 uint64_t hash64(uint64_t key, uint32_t seed) {
     uint64_t k = 0x8648DBDB;          // Mixing constant
@@ -191,6 +199,57 @@ public:
             } else { current_chunk = next_chunk; }
         }
     }
+
+    // Single-threaded build, no locks needed. Used in Radix Join.
+    void build_local(const KeyType* keys, const ValueType* values, size_t size) {
+        for (size_t i = 0; i < size; ++i) {
+            insert_local(keys[i], values[i]);
+        }
+    }
+    
+    // Single-threaded insert, no locks needed.
+    void insert_local(const KeyType& key, const ValueType& value) {
+        uint64_t hash = hasher_(key);
+        uint64_t bucket_idx = get_bucket_idx(hash);
+        uint8_t tag = get_hash_tag(hash);
+        
+        Chunk* current_chunk = buckets_[bucket_idx].load(std::memory_order_relaxed);
+
+        if (current_chunk == nullptr) {
+            Chunk* new_chunk = alloc_chunk_from_pool();
+            new_chunk->tags[0] = tag;
+            new_chunk->keys[0] = key;
+            new_chunk->values[0] = value;
+            new_chunk->count.store(1, std::memory_order_relaxed);
+            buckets_[bucket_idx].store(new_chunk, std::memory_order_relaxed);
+            return;
+        }
+        
+        while (true) {
+            // Relaxed ordering is sufficient for single-threaded context.
+            uint32_t slot = current_chunk->count.load(std::memory_order_relaxed);
+            if (slot < ChunkSize) {
+                current_chunk->tags[slot] = tag;
+                current_chunk->keys[slot] = key;
+                current_chunk->values[slot] = value;
+                current_chunk->count.store(slot + 1, std::memory_order_relaxed);
+                return;
+            }
+            
+            Chunk* next_chunk = current_chunk->next.load(std::memory_order_relaxed);
+            if (next_chunk == nullptr) {
+                Chunk* new_chunk = alloc_chunk_from_pool();
+                new_chunk->tags[0] = tag;
+                new_chunk->keys[0] = key;
+                new_chunk->values[0] = value;
+                new_chunk->count.store(1, std::memory_order_relaxed);
+                current_chunk->next.store(new_chunk, std::memory_order_relaxed);
+                return;
+            }
+            current_chunk = next_chunk;
+        }
+    }
+
 
     void build(const KeyType* keys, const ValueType* values, size_t size) {
         size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
@@ -415,8 +474,7 @@ public:
 
 using HT = UnchainedHashTable<uint64_t, uint64_t>;
 
-// --- Public Functions and Passes ---
-// (The following code remains unchanged as it depends on the HT class interface, not its implementation)
+// --- Original Implementation (Single Large Hash Table) ---
 
 std::pair<size_t, std::vector<size_t>>
 count_scalar_pass(const HT& ht, const uint64_t* probe_keys_ptr, size_t probe_size, size_t num_threads) {
@@ -489,7 +547,6 @@ py::int_ hash_join_count_scalar(py::array_t<uint64_t> build_keys,
              build_keys_buf.size);
 
     size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
-    std::cout << "num_threads = " << num_threads << std::endl;
     auto [total_results, offsets] = count_scalar_pass(ht, static_cast<uint64_t*>(probe_keys_buf.ptr), probe_keys_buf.size, num_threads);
     
     return py::int_(total_results);
@@ -523,16 +580,13 @@ py::tuple hash_join_scalar(py::array_t<uint64_t> build_keys,
         size_t end = std::min(start + work_per_thread, probe_size);
         if (start >= end) continue;
         threads.emplace_back([&, i, start, end]() {
-            // Get the starting write position for this thread
             size_t current_offset = offsets[i];
             for (size_t j = start; j < end; ++j) {
-                // Directly write results to the final destination
                 size_t matches_found = ht.probe_write(
                     probe_keys_ptr[j],
                     result_keys_ptr + current_offset,
                     result_values_ptr + current_offset
                 );
-                // Advance the write pointer by the number of matches found
                 current_offset += matches_found;
             }
         });
@@ -556,7 +610,6 @@ py::int_ hash_join_count_batch(py::array_t<uint64_t> build_keys,
              build_keys_buf.size);
 
     size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
-    std::cout << "num_threads = " << num_threads << std::endl;
     auto [total_results, offsets] = count_batch_pass(ht, static_cast<uint64_t*>(probe_keys_buf.ptr), probe_keys_buf.size, num_threads);
 
     return py::int_(total_results);
@@ -578,7 +631,6 @@ py::tuple hash_join_batch(py::array_t<uint64_t> build_keys,
              build_keys_buf.size);
 
     size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
-    std::cout << "num_threads = " << num_threads << std::endl;
     auto [total_results, offsets] = count_batch_pass(ht, probe_keys_ptr, probe_size, num_threads);
 
     py::array_t<uint64_t> result_keys(total_results);
@@ -603,25 +655,306 @@ py::tuple hash_join_batch(py::array_t<uint64_t> build_keys,
     return py::make_tuple(result_keys, result_values);
 }
 
+// --- New Radix Partitioning Implementation ---
+
+// Helper function to extract the partition index from a hash
+inline size_t get_partition_idx(uint64_t hash) {
+    // Use the most significant bits for partitioning
+    return hash >> (64 - RADIX_BITS);
+}
+
+// Partitions key-value pairs
+std::tuple<std::vector<uint64_t>, std::vector<uint64_t>, std::vector<size_t>>
+parallel_radix_partition_kv(const uint64_t* keys, const uint64_t* values, size_t size, size_t num_threads) {
+    std::vector<uint64_t> out_keys(size);
+    std::vector<uint64_t> out_values(size);
+    std::vector<size_t> partition_offsets(NUM_PARTITIONS + 1, 0);
+    Hasher<uint64_t> hasher;
+
+    // Phase 1: Build histograms in parallel
+    std::vector<std::vector<size_t>> histograms(num_threads, std::vector<size_t>(NUM_PARTITIONS, 0));
+    size_t work_per_thread = (size + num_threads - 1) / num_threads;
+    std::vector<std::thread> threads;
+
+    for (size_t i = 0; i < num_threads; ++i) {
+        size_t start = i * work_per_thread;
+        size_t end = std::min(start + work_per_thread, size);
+        if (start >= end) continue;
+        threads.emplace_back([&, i, start, end]() {
+            for (size_t j = start; j < end; ++j) {
+                uint64_t hash = hasher(keys[j]);
+                histograms[i][get_partition_idx(hash)]++;
+            }
+        });
+    }
+    for (auto& t : threads) { t.join(); }
+
+    // Phase 2: Calculate prefix sums to determine write positions
+    for (size_t i = 0; i < num_threads; ++i) {
+        for (size_t j = 0; j < NUM_PARTITIONS; ++j) {
+            partition_offsets[j + 1] += histograms[i][j];
+        }
+    }
+    for (size_t i = 1; i <= NUM_PARTITIONS; ++i) {
+        partition_offsets[i] += partition_offsets[i - 1];
+    }
+    
+    // Phase 3: Scatter data to partitioned buffers in parallel
+    std::vector<size_t> current_offsets = partition_offsets;
+    threads.clear();
+    for (size_t i = 0; i < num_threads; ++i) {
+        size_t start = i * work_per_thread;
+        size_t end = std::min(start + work_per_thread, size);
+        if (start >= end) continue;
+        threads.emplace_back([&, i, start, end]() {
+            std::vector<size_t> local_write_offsets(NUM_PARTITIONS);
+            // Determine this thread's starting write position for each partition
+            for(size_t p=0; p < NUM_PARTITIONS; ++p) {
+                size_t offset = partition_offsets[p];
+                for(size_t t=0; t < i; ++t) {
+                    offset += histograms[t][p];
+                }
+                local_write_offsets[p] = offset;
+            }
+
+            for (size_t j = start; j < end; ++j) {
+                uint64_t hash = hasher(keys[j]);
+                size_t p_idx = get_partition_idx(hash);
+                size_t write_pos = local_write_offsets[p_idx]++;
+                out_keys[write_pos] = keys[j];
+                out_values[write_pos] = values[j];
+            }
+        });
+    }
+    for (auto& t : threads) { t.join(); }
+    
+    return {std::move(out_keys), std::move(out_values), std::move(partition_offsets)};
+}
+
+// Overload for partitioning only keys (for the probe side)
+std::tuple<std::vector<uint64_t>, std::vector<size_t>>
+parallel_radix_partition_k(const uint64_t* keys, size_t size, size_t num_threads) {
+    std::vector<uint64_t> out_keys(size);
+    std::vector<size_t> partition_offsets(NUM_PARTITIONS + 1, 0);
+    Hasher<uint64_t> hasher;
+
+    // This logic is identical to the KV version, just without handling values.
+    std::vector<std::vector<size_t>> histograms(num_threads, std::vector<size_t>(NUM_PARTITIONS, 0));
+    size_t work_per_thread = (size + num_threads - 1) / num_threads;
+    std::vector<std::thread> threads;
+
+    for (size_t i = 0; i < num_threads; ++i) {
+        size_t start = i * work_per_thread;
+        size_t end = std::min(start + work_per_thread, size);
+        if (start >= end) continue;
+        threads.emplace_back([&, i, start, end]() {
+            for (size_t j = start; j < end; ++j) {
+                uint64_t hash = hasher(keys[j]);
+                histograms[i][get_partition_idx(hash)]++;
+            }
+        });
+    }
+    for (auto& t : threads) { t.join(); }
+
+    for (size_t i = 0; i < num_threads; ++i) {
+        for (size_t j = 0; j < NUM_PARTITIONS; ++j) {
+            partition_offsets[j + 1] += histograms[i][j];
+        }
+    }
+    for (size_t i = 1; i <= NUM_PARTITIONS; ++i) {
+        partition_offsets[i] += partition_offsets[i - 1];
+    }
+    
+    threads.clear();
+    for (size_t i = 0; i < num_threads; ++i) {
+        size_t start = i * work_per_thread;
+        size_t end = std::min(start + work_per_thread, size);
+        if (start >= end) continue;
+        threads.emplace_back([&, i, start, end]() {
+            std::vector<size_t> local_write_offsets(NUM_PARTITIONS);
+            for(size_t p=0; p < NUM_PARTITIONS; ++p) {
+                size_t offset = partition_offsets[p];
+                for(size_t t=0; t < i; ++t) {
+                    offset += histograms[t][p];
+                }
+                local_write_offsets[p] = offset;
+            }
+
+            for (size_t j = start; j < end; ++j) {
+                uint64_t hash = hasher(keys[j]);
+                size_t p_idx = get_partition_idx(hash);
+                size_t write_pos = local_write_offsets[p_idx]++;
+                out_keys[write_pos] = keys[j];
+            }
+        });
+    }
+    for (auto& t : threads) { t.join(); }
+    
+    return {std::move(out_keys), std::move(partition_offsets)};
+}
+
+
+py::int_ hash_join_count_radix(py::array_t<uint64_t> build_keys,
+                                py::array_t<uint64_t> build_values,
+                                py::array_t<uint64_t> probe_keys) {
+    py::buffer_info build_keys_buf = build_keys.request();
+    py::buffer_info build_values_buf = build_values.request();
+    py::buffer_info probe_keys_buf = probe_keys.request();
+    size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
+
+    // 1. Partition both build and probe sides
+    auto [p_build_keys, p_build_values, build_offsets] = parallel_radix_partition_kv(
+        static_cast<uint64_t*>(build_keys_buf.ptr), static_cast<uint64_t*>(build_values_buf.ptr), build_keys_buf.size, num_threads);
+    
+    auto [p_probe_keys, probe_offsets] = parallel_radix_partition_k(
+        static_cast<uint64_t*>(probe_keys_buf.ptr), probe_keys_buf.size, num_threads);
+
+    // 2. Join partitions in parallel
+    std::atomic<size_t> total_results{0};
+    std::vector<std::thread> threads;
+    for (size_t p_idx = 0; p_idx < NUM_PARTITIONS; ++p_idx) {
+        threads.emplace_back([&, p_idx]() {
+            size_t build_start = build_offsets[p_idx];
+            size_t build_end = build_offsets[p_idx + 1];
+            size_t build_size = build_end - build_start;
+
+            size_t probe_start = probe_offsets[p_idx];
+            size_t probe_end = probe_offsets[p_idx + 1];
+            size_t probe_size = probe_end - probe_start;
+
+            if (build_size == 0 || probe_size == 0) return;
+
+            // Build a local, non-thread-safe hash table for this partition
+            HT local_ht(build_size, build_size);
+            local_ht.build_local(&p_build_keys[build_start], &p_build_values[build_start], build_size);
+            
+            // Probe and count
+            size_t local_count = local_ht.probe_and_count_batch(&p_probe_keys[probe_start], probe_size);
+            total_results.fetch_add(local_count, std::memory_order_relaxed);
+        });
+    }
+    for(auto& t : threads) { t.join(); }
+
+    return py::int_(total_results.load());
+}
+
+py::tuple hash_join_radix(py::array_t<uint64_t> build_keys,
+                          py::array_t<uint64_t> build_values,
+                          py::array_t<uint64_t> probe_keys) {
+    py::buffer_info build_keys_buf = build_keys.request();
+    py::buffer_info build_values_buf = build_values.request();
+    py::buffer_info probe_keys_buf = probe_keys.request();
+    size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
+
+    // 1. Partition both build and probe sides
+    auto [p_build_keys, p_build_values, build_offsets] = parallel_radix_partition_kv(
+        static_cast<uint64_t*>(build_keys_buf.ptr), static_cast<uint64_t*>(build_values_buf.ptr), build_keys_buf.size, num_threads);
+    
+    auto [p_probe_keys, probe_offsets] = parallel_radix_partition_k(
+        static_cast<uint64_t*>(probe_keys_buf.ptr), probe_keys_buf.size, num_threads);
+
+    // 2. First pass: count results per partition to pre-allocate memory
+    std::vector<PaddedCounter> partition_counts(NUM_PARTITIONS);
+    std::vector<std::thread> threads;
+    
+    size_t work_per_thread_part = (NUM_PARTITIONS + num_threads - 1) / num_threads;
+    for (size_t i = 0; i < num_threads; ++i) {
+        size_t start_p = i * work_per_thread_part;
+        size_t end_p = std::min(start_p + work_per_thread_part, NUM_PARTITIONS);
+        if (start_p >= end_p) continue;
+
+        threads.emplace_back([&, start_p, end_p]() {
+            for (size_t p_idx = start_p; p_idx < end_p; ++p_idx) {
+                size_t build_size = build_offsets[p_idx + 1] - build_offsets[p_idx];
+                size_t probe_size = probe_offsets[p_idx + 1] - probe_offsets[p_idx];
+                if (build_size == 0 || probe_size == 0) {
+                    partition_counts[p_idx].value.store(0, std::memory_order_relaxed);
+                    continue;
+                }
+                
+                HT local_ht(build_size, build_size);
+                local_ht.build_local(&p_build_keys[build_offsets[p_idx]], &p_build_values[build_offsets[p_idx]], build_size);
+                
+                size_t local_count = local_ht.probe_and_count_batch(&p_probe_keys[probe_offsets[p_idx]], probe_size);
+                partition_counts[p_idx].value.store(local_count, std::memory_order_relaxed);
+            }
+        });
+    }
+    for(auto& t : threads) { t.join(); }
+
+    // Calculate total size and offsets for writing results
+    std::vector<size_t> result_offsets(NUM_PARTITIONS + 1, 0);
+    for (size_t i = 0; i < NUM_PARTITIONS; ++i) {
+        result_offsets[i+1] = result_offsets[i] + partition_counts[i].value.load(std::memory_order_relaxed);
+    }
+    size_t total_results = result_offsets[NUM_PARTITIONS];
+
+    // Allocate final result arrays
+    py::array_t<uint64_t> result_keys(total_results);
+    py::array_t<uint64_t> result_values(total_results);
+    uint64_t* result_keys_ptr = static_cast<uint64_t*>(result_keys.request().ptr);
+    uint64_t* result_values_ptr = static_cast<uint64_t*>(result_values.request().ptr);
+
+    // 3. Second pass: build and probe again to materialize results
+    threads.clear();
+    for (size_t i = 0; i < num_threads; ++i) {
+        size_t start_p = i * work_per_thread_part;
+        size_t end_p = std::min(start_p + work_per_thread_part, NUM_PARTITIONS);
+        if (start_p >= end_p) continue;
+        
+        threads.emplace_back([&, start_p, end_p]() {
+            for (size_t p_idx = start_p; p_idx < end_p; ++p_idx) {
+                size_t build_size = build_offsets[p_idx + 1] - build_offsets[p_idx];
+                size_t probe_size = probe_offsets[p_idx + 1] - probe_offsets[p_idx];
+                if (build_size == 0 || probe_size == 0) continue;
+                
+                HT local_ht(build_size, build_size);
+                local_ht.build_local(&p_build_keys[build_offsets[p_idx]], &p_build_values[build_offsets[p_idx]], build_size);
+                
+                local_ht.probe_batch_write(
+                    &p_probe_keys[probe_offsets[p_idx]], probe_size,
+                    result_keys_ptr + result_offsets[p_idx],
+                    result_values_ptr + result_offsets[p_idx]
+                );
+            }
+        });
+    }
+    for(auto& t : threads) { t.join(); }
+    
+    return py::make_tuple(result_keys, result_values);
+}
+
+
 void initialize_memory_system() {
-    // Initialize mimalloc without overriding system malloc
-    // This allows coexistence with numpy/pandas memory allocators
-    mi_version();  // Simple call to ensure mimalloc is initialized
+    mi_version();
     return;
 }
 
 PYBIND11_MODULE(flash_join, m) {
     initialize_memory_system();
     m.doc() = "A high-performance hash join with various optimization strategies"; 
+
+    // Original implementation (single global hash table)
     m.def("hash_join", &hash_join_batch, 
-          "Performs a hash join and returns the full result",
+          "Performs a hash join using a single concurrent hash table",
           py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
 
     m.def("hash_join_count", &hash_join_count_batch, 
-          "Performs a hash join and returns only the count of results",
+          "Performs a hash join and returns only the count (single concurrent hash table)",
           py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
 
+    // Radix partitioning implementation
+    m.def("hash_join_radix", &hash_join_radix, 
+          "Performs a hash join using radix partitioning",
+          py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
+
+    m.def("hash_join_count_radix", &hash_join_count_radix, 
+          "Performs a hash join and returns only the count (radix partitioning)",
+          py::arg("build_keys"), py::arg("build_values"), py::arg("probe_keys"));
+
+    // Exposing older scalar versions for benchmarking
     m.def("hash_join_scalar", &hash_join_scalar, "Original two-pass hash join (scalar probe)");
     m.def("hash_join_count_scalar", &hash_join_count_scalar, "Original optimized count hash join (scalar probe)");
+
     m.def("initialize", &initialize_memory_system, "Initializes the custom memory allocator.");
 }
