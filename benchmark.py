@@ -49,29 +49,47 @@ print("-" * 80)
 def run_benchmark(label, task_name, threads, func):
     """
     A helper function to run a benchmark, time it, and print results in a standard format.
-    - func: A no-argument lambda function that executes the actual benchmark and returns a result.
+    - func: A no-argument lambda function that executes the actual benchmark.
+            It can return a single value (result) or a tuple (result, core_time).
     """
     print(f"\n  🚀 Starting benchmark for {label} ({task_name})...")
     start_time = time.perf_counter()
-    result = func()
+    raw_result = func()
     end_time = time.perf_counter()
-    duration = end_time - start_time
     
-    # User-friendly print
-    print(f"     - Finished in: {duration:.4f} seconds")
-    if isinstance(result, (int, np.integer)):
-        print(f"     - Result (count): {result:,}")
-        result_str = str(result)
-    elif result is not None:
-        print(f"     - Result (length): {len(result):,}")
-        result_str = str(len(result[0]))
+    duration_total = end_time - start_time
+    core_duration = None
+    
+    # --- NEW: Handle tuple return from flash_join ---
+    if isinstance(raw_result, tuple) and len(raw_result) == 2:
+        result, core_duration = raw_result
     else:
-        print(f"     - Result: None")
-        result_str = "N/A"
+        result = raw_result
+
+    # User-friendly print
+    print(f"     - Finished in (Total): {duration_total:.4f} seconds")
+    if core_duration is not None:
+        overhead = duration_total - core_duration
+        overhead_percent = (overhead / duration_total * 100) if duration_total > 0 else 0
+        print(f"     - Core C++ Time:     {core_duration:.4f} seconds")
+        print(f"     - Python Overhead:   {overhead:.4f} seconds ({overhead_percent:.1f}%)")
+
+    # Ensure result is int for formatting before printing
+    result_int = int(result) if result is not None else 0
+    print(f"     - Result (count): {result_int:,}")
+    result_str = str(result)
         
     # Standardized output for easy parsing
-    print(f"    RESULT,Library={label},Task={task_name},Threads={threads},Time={duration:.4f},Result={result_str}")
-    return duration
+    print(f"    RESULT,Library={label},Task={task_name},Threads={threads},Time={duration_total:.4f},Result={result_str}")
+    
+    # Return a dictionary for easier data handling later
+    benchmark_data = {
+        'total_time': duration_total
+    }
+    if core_duration is not None:
+        benchmark_data['core_time'] = core_duration
+        
+    return benchmark_data
 
 # --- Plotting Function ---
 def plot_results(results_df, task_name, output_filename="benchmark_results.png"):
@@ -90,7 +108,7 @@ def plot_results(results_df, task_name, output_filename="benchmark_results.png")
 
     # Sort implementations for consistent color ordering in the plot
     # A custom order can make the plot more readable
-    impl_order = sorted(task_df['implementation'].unique())
+    impl_order = sorted(task_df['implementation'].unique(), key=lambda x: ('(Core)' in x, x))
     
     plt.style.use('seaborn-v0_8-whitegrid')
     fig, ax = plt.subplots(figsize=(16, 9))
@@ -226,14 +244,20 @@ def main():
                 'flash_join_radix_bloom': (flash_join.hash_join_count_radix_bloom, flash_join.hash_join_radix_bloom),
             }
             for label, (count_func, mat_func) in impl_map.items():
-                duration_count = run_benchmark(label, "join_count", args.threads, lambda: count_func(build_keys, build_values, probe_keys))
-                results_for_plotting.append({'case': case_id, 'implementation': label, 'task': 'join_count', 'time': duration_count})
-                
-                duration_mat = run_benchmark(label, "join_materialize", args.threads, lambda: mat_func(build_keys, build_values, probe_keys))
-                results_for_plotting.append({'case': case_id, 'implementation': label, 'task': 'join_materialize', 'time': duration_mat})
+                # Benchmark for join_count
+                count_data = run_benchmark(label, "join_count", args.threads, lambda: count_func(build_keys, build_values, probe_keys))
+                # results_for_plotting.append({'case': case_id, 'implementation': label, 'task': 'join_count', 'time': count_data['total_time']})
+                if 'core_time' in count_data:
+                    results_for_plotting.append({'case': case_id, 'implementation': f"{label} (Core)", 'task': 'join_count', 'time': count_data['core_time']})
+
+                # Benchmark for join_materialize
+                mat_data = run_benchmark(label, "join_materialize", args.threads, lambda: mat_func(build_keys, build_values, probe_keys))
+                # results_for_plotting.append({'case': case_id, 'implementation': label, 'task': 'join_materialize', 'time': mat_data['total_time']})
+                if 'core_time' in mat_data:
+                    results_for_plotting.append({'case': case_id, 'implementation': f"{label} (Core)", 'task': 'join_materialize', 'time': mat_data['core_time']})
+
 
             # --- DuckDB Benchmarks ---
-            # ... (DuckDB logic remains the same) ...
             con = duckdb.connect(database=':memory:')
             con.execute(f"PRAGMA THREADS={args.threads}")
 
@@ -241,14 +265,19 @@ def main():
             con.execute("CREATE TABLE build_native AS SELECT * FROM build_df;")
             con.execute("CREATE TABLE probe_native AS SELECT * FROM probe_df;")
             duration_ingest = time.perf_counter() - start_ingest
+            print(f"\n  ℹ️  DuckDB data ingestion took: {duration_ingest:.4f} seconds")
             
-            duration_join_count = run_benchmark("duckdb", "join_count", args.threads, 
+            # Run DuckDB benchmarks
+            count_data_duckdb = run_benchmark("duckdb", "join_count", args.threads, 
                                                 lambda: con.execute("SELECT count(*) FROM build_native b JOIN probe_native p ON b.key = p.key;").fetchone()[0])
+            duration_join_count = count_data_duckdb['total_time']
             
             def duckdb_materialize_and_count():
                 con.execute("CREATE OR REPLACE TEMPORARY TABLE temp AS SELECT p.key, b.value FROM build_native b JOIN probe_native p ON b.key = p.key;")
                 return con.execute("SELECT count(*) FROM temp").fetchone()[0]
-            duration_join_materialize = run_benchmark("duckdb", "join_materialize", args.threads, duckdb_materialize_and_count)
+
+            mat_data_duckdb = run_benchmark("duckdb", "join_materialize", args.threads, duckdb_materialize_and_count)
+            duration_join_materialize = mat_data_duckdb['total_time']
             con.close()
 
             # Add DuckDB results to plotting data
