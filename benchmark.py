@@ -156,7 +156,7 @@ if __name__ == "__main__":
 
     start_join = time.perf_counter()
     # This query now runs entirely on DuckDB's internal, parallel-friendly format
-    query = "SELECT * FROM probe_native AS p JOIN build_native AS b ON p.key = b.key"
+    query = "SELECT p.key, b.value FROM probe_native AS p JOIN build_native AS b ON p.key = b.key"
     duckdb_result = con.execute(query).arrow()
     end_join = time.perf_counter()
     duration_join = end_join - start_join
