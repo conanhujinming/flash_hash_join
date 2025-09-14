@@ -104,8 +104,8 @@ if __name__ == "__main__":
     start_time_cpp = time.perf_counter()
     cpp_count = flash_join.hash_join_count_scalar(build_keys, build_values, probe_keys)
     end_time_cpp = time.perf_counter()
-    duration_cpp = end_time_cpp - start_time_cpp
-    print(f"C++ (flash_join_count_scalar) finished in: {duration_cpp:.4f} seconds")
+    duration_cpp_count = end_time_cpp - start_time_cpp
+    print(f"C++ (flash_join_count_scalar) finished in: {duration_cpp_count:.4f} seconds")
 
     build_file = 'build.parquet'
     probe_file = 'probe.parquet'
@@ -156,7 +156,9 @@ if __name__ == "__main__":
 
     start_join = time.perf_counter()
     # This query now runs entirely on DuckDB's internal, parallel-friendly format
-    query = "SELECT p.key, b.value FROM probe_native AS p JOIN build_native AS b ON p.key = b.key"
+    query = '''
+        CREATE OR REPLACE TEMPORARY TABLE temp_join_result AS
+        SELECT p.key, b.value FROM probe_native AS p JOIN build_native AS b ON p.key = b.key'''
     duckdb_result = con.execute(query).arrow()
     end_join = time.perf_counter()
     duration_join = end_join - start_join
@@ -168,6 +170,7 @@ if __name__ == "__main__":
     # --- Results Summary ---
     print("\n" + "="*40)
     print("📊 Final Performance Summary (End-to-End)")
+    print(f"Our C++ (Build + Probe) count:  {duration_cpp_count:.4f} seconds")
     print(f"Our C++ (Build + Probe):  {duration_cpp:.4f} seconds")
     print(f"DuckDB (Ingest + Join count):   {duration_duckdb_total_count:.4f} seconds")
     print(f"  - DuckDB Ingest phase:    ({duration_ingest:.4f}s)")
