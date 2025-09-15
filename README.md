@@ -1,9 +1,3 @@
-好的，当然！这是一个根据你的新代码更新后的README。
-
-我将重点突出新增的`adaptive_join`功能，并将其定位为推荐给大多数用户的首选接口。同时，我将原有的特定算法实现重新组织为“核心策略”，这样既能保留其技术深度，又能使用户的入门路径更清晰。
-
----
-
 # Flash Join
 
 Flash Join is a high-performance, parallel hash join library implemented in C++ with a Python interface. It is designed to deliver extreme speed for data analysis tasks. By leveraging modern CPU architectures and an intelligent adaptive execution engine, Flash Join demonstrates superior performance, often outperforming the industry-leading in-memory database DuckDB.
