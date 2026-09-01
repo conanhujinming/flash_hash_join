@@ -1,126 +1,149 @@
 # Flash Join
 
-Flash Join is a high-performance, parallel hash join library implemented in C++ with a Python interface. It is designed to deliver extreme speed for data analysis tasks. By leveraging modern CPU architectures and an intelligent adaptive execution engine, Flash Join demonstrates superior performance, often outperforming the industry-leading in-memory database DuckDB.
+Flash Join is a parallel `uint64` hash join for NumPy. Version 0.2 replaces the
+old linear-probing table with the **unchained** join table described in
+CedarDB's [Simple, Efficient, and Robust Hash Tables for Join Processing](https://cedardb.com/blog/simple_efficient_hash_tables/)
+and its linked [DaMoN '24 paper](https://db.in.tum.de/~birler/papers/hashtable.pdf).
 
-This project is open-source and released under the MIT license.
+The project intentionally exposes a small engine rather than claiming to be a
+general database replacement. `benchmarks/benchmark.py` compares the join core
+with DuckDB using the same thread count and validates result cardinality before
+reporting timings.
 
-## New: Adaptive Join - The Best of Both Worlds
+## CedarDB design correspondence
 
-The latest version of Flash Join introduces a powerful **adaptive join strategy**, which is now the recommended API for most use cases.
+| CedarDB technique | Flash Join implementation |
+| --- | --- |
+| Power-of-two directory sized as `2^ceil(log2(1.125n))` | `UnchainedHashTable::directory_capacity` |
+| High hash bits select a directory slot | Shift-only `slot_for` |
+| Dense adjacency array for collisions and duplicates | Consecutive `BuildTuple` ranges |
+| Neighboring entries delimit each range | Branch-free `directory[-1]` sentinel and packed end offsets |
+| Per-slot 16-bit register-blocked Bloom filter | Compile-time `UseBloomFilter` policy; enabled entries use their low 16 bits |
+| Four-bit tags from a 4 KiB, 2048-entry table | All 1820 four-of-sixteen tags plus deterministic uniform padding |
+| CRC hash specialized for 64-bit keys | Two hardware CRC32C operations and the paper's `0x2545F4914F6CDD1D` multiply |
+| Parallel, lock-free build via partition ownership | Build-side hash partitioning followed by per-partition count/prefix/copy |
+| Dense writes during tuple collection | Small software write-combine buffers |
+| Tight probe loop with CPU-managed memory-level parallelism | No explicit prefetch; Bloom-enabled non-matches stop at the fused check |
 
--   **Core Idea**: Different join algorithms excel under different conditions. A classic hash join has low overhead and is perfect for smaller datasets, while a radix join's partitioning strategy is more cache-efficient and scalable for larger datasets. Manually choosing between them can be complex.
--   **How it Works**: The `adaptive_join` function automatically analyzes the input data (specifically, the size of the build table) and selects the optimal underlying algorithm at runtime.
-    -   For **small build tables** (e.g., < 1 million rows), it uses a highly optimized **Scalar Hash Join**.
-    -   For **large build tables**, it automatically switches to a cache-friendly **Radix Join**.
--   **Benefit**: You get the best possible performance without needing to be an expert in join algorithms. It's intelligent, hands-off performance optimization.
+Unlike the previous implementation, duplicate build keys are never discarded:
+the table has the multimap semantics required by relational joins.
 
-### Quick Example
+## Repository layout
 
-Using the new adaptive API is simple:
+```text
+flash_hash_join/
+├── include/flash_join/        # Hashing, parallel helpers, unchained table
+├── src/                       # Python extension bindings and join operators
+├── tests/                     # Correctness and Bloom-policy equivalence tests
+├── benchmarks/                # Synthetic and H2O/DuckDB benchmarks
+├── scripts/                   # Dataset generation utilities
+├── CMakeLists.txt             # Native target
+└── pyproject.toml             # Python build/package metadata
+```
+
+The historical benchmark charts in the repository root predate the unchained
+implementation. New benchmark runs write raw measurements under `artifacts/`,
+which is intentionally ignored by Git.
+
+## Build and test
+
+Python 3.9+, CMake 3.20+, and a C++17 compiler are required. Hardware CRC32C is
+used on SSE4.2 x86-64 and CRC-capable AArch64; other targets use a portable
+fallback.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[test,benchmark]'
+pytest
+```
+
+The extension no longer requires mimalloc to build. The existing submodule is
+kept for reproducibility of older revisions but is not part of the v0.2 target.
+
+## Python API
 
 ```python
-import flash_join
 import numpy as np
+import flash_join
 
-# Assume build_keys, build_values, and probe_keys are NumPy arrays
-# ...
+build_keys = np.array([1, 1, 2], dtype=np.uint64)
+build_values = np.array([10, 11, 20], dtype=np.uint64)
+probe_keys = np.array([1, 2, 3], dtype=np.uint64)
 
-# Let Flash Join choose the best strategy automatically
-num_matches, time_taken = flash_join.adaptive_join(
-    build_keys, 
-    build_values, 
-    probe_keys
+flash_join.set_num_threads(8)
+
+# Includes both rows for duplicate key 1.
+count, core_seconds = flash_join.join_count(
+    build_keys, build_values, probe_keys
 )
 
-print(f"Found {num_matches} matches in {time_taken:.4f} seconds.")
+# Materializes internally, matching the DuckDB materialization benchmark.
+count, core_seconds = flash_join.join(
+    build_keys, build_values, probe_keys
+)
+
+# Retrieve materialized columns when the rows themselves are needed.
+joined_keys, joined_values, core_seconds = flash_join.join_pairs(
+    build_keys, build_values, probe_keys
+)
+
+# Compile-time specialization with all Bloom work removed.
+count, core_seconds = flash_join.join_count_no_bloom(
+    build_keys, build_values, probe_keys
+)
 ```
 
-## Underlying Core Strategies
+The API deliberately does not preserve the old combinatorial `adaptive_*`,
+`*_bloom`, or `*_radix` aliases. The only variants are the default CedarDB Bloom
+layout and the explicit `*_no_bloom` experiment. Build-side partitioning remains
+an internal parallel-build stage rather than a separate join algorithm.
 
-Flash Join's adaptive engine chooses between two powerful, battle-tested join strategies. For expert users or benchmarking purposes, these can still be called directly.
+## Benchmark
 
-*   **Scalar Hash Join (`flash_join`)**
-    *   **Core Idea**: Builds a single, global hash table using cache-friendly **Linear Probing** for collision resolution. This avoids the pointer-chasing overhead of separate chaining and is designed for maximum data locality, which is extremely efficient when the entire hash table fits comfortably in the CPU caches.
-    *   **Inspiration**: This approach is heavily inspired by the techniques described in the CedarDB blog post "[Simple, Efficient Hash Tables](https://cedardb.com/blog/simple_efficient_hash_tables/)".
-    *   **Best for**: Smaller build tables where the overhead of partitioning would outweigh the benefits.
-
-*   **Radix Join (`flash_join_radix`)**
-    *   **Core Idea**: A "no-hash-table" join algorithm that works by partitioning both the build and probe tables into many small, cache-aligned chunks based on the radix (binary representation) of the join keys. Each pair of corresponding partitions is then joined independently.
-    *   **Best for**: Large build tables. This divide-and-conquer approach ensures that each sub-problem is small enough to fit within the CPU's L1/L2 caches, drastically reducing cache misses and enabling massive parallelism.
-
-## Available Optimizations
-
-*   **Bloom Filters (`_bloom` suffix)**
-    *   **Core Idea**: Builds a compact Bloom filter alongside the hash table. During the probe phase, this filter is checked first to rapidly prune probe keys that are guaranteed not to have a match. This significantly reduces memory accesses to the main hash table.
-    *   **Availability**: This optimization can be applied to both the adaptive and the explicit APIs (e.g., `adaptive_join_bloom`, `hash_join_bloom`).
-    *   **Best for**: Joins where a large percentage of probe keys do not have a match in the build table (low join selectivity).
-
-## Performance
-
-The core objective of this project is raw performance. The included benchmark script (`benchmark.py`) compares our underlying implementations against DuckDB on two common join tasks:
-
-1.  **Join Count**: Calculates the total number of resulting rows from the join without materializing them. This primarily measures the performance of the core build and probe phases.
-2.  **Join Materialize**: Creates and returns the complete set of joined rows. This is a more realistic end-to-end test that reflects real-world application workloads.
-
-The benchmark automatically generates performance comparison charts.
-
-## Getting Started
-
-### Prerequisites
-- A C++ compiler (g++ or clang with C++17 support)
-- CMake (>= 3.10)
-- Python (>= 3.7)
-- R environment
-  - Requires the `data.table` and `arrow` packages.
-
-### Setup and Execution
-
-#### 1. Clone the Repository
-```bash
-# Clone the repository and all its submodules
-git clone --recurse-submodules https://github.com/conanhujinming/flash_hash_join.git
-cd flash_hash_join
-```
-
-#### 2. Generate Benchmark Data
-The benchmark requires a specific dataset. Please follow these steps to generate it.
+Run the deterministic synthetic comparison:
 
 ```bash
-# First, ensure your R environment has the necessary packages.
-# You can run the following command in an R console:
-# install.packages(c("data.table", "arrow"))
-
-# Next, run the data generation script.
-# This will create a series of CSV files in the ./data directory.
-bash ./generate-data.sh
-```
-**Note**: This data generation process may take several minutes to complete.
-
-#### 3. Install Python Dependencies
-```bash
-pip install -r requirements.txt
+python benchmarks/benchmark.py \
+  --threads 8 \
+  --build-size 1000000 \
+  --probe-size 10000000 \
+  --match-rate 0.5 \
+  --repeats 5
 ```
 
-#### 4. Build the C++ Extension
-This command compiles the C++ source code into a Python extension module that can be imported directly into your Python scripts.
-```bash
-python setup.py build_ext --inplace
-```
+`--match-rate` controls join selectivity. The fused Bloom fast path is designed
+for selective workloads, so benchmark both the expected production rate and a
+high-match stress case rather than relying on one aggregate number. Every run
+reports `flash_join_bloom`, `flash_join_no_bloom`, and `duckdb`.
 
-#### 5. Run the Benchmark
-You are now ready to run the performance tests.
+Run the original db-benchmark join key distributions directly in memory:
 
 ```bash
-# Run the benchmark using all available CPU cores
-python benchmark.py
-
-# You can also specify the number of threads to use
-python benchmark.py --threads 8
+python benchmarks/benchmark.py \
+  --db-benchmark-size 10000000 \
+  --threads 8 \
+  --repeats 11
 ```
-After the script finishes, it will generate two result images in the project's root directory:
-- `benchmark_join_count.png`
-- `benchmark_join_materialize.png`
+
+This is a NumPy port of `db-benchmark/_data/join-datagen.R`: it retains the 90%
+common, 10% side-only domains and `sample_all` multiplicities, while generating
+only the columns consumed by this uint64 join. Q4 dictionary-encodes the original
+`id5` string representation back to its `id2` equality domain.
+
+Alternatively, if R and data.table are installed, generate and read the original
+CSV files:
+
+```bash
+git submodule update --init db-benchmark
+bash scripts/generate_data.sh
+python benchmarks/benchmark.py --data-dir data --threads 8 --repeats 5
+```
+
+For both engines, ingestion happens before timing. The benchmark records the
+median join time, checks identical row counts, and writes the raw CSV to
+`artifacts/benchmark.csv`.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+[MIT](LICENSE)

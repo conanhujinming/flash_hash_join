@@ -1,64 +1,47 @@
-cmake_minimum_required(VERSION 3.12)
-project(flash_join)
+cmake_minimum_required(VERSION 3.20)
 
-# --- Python & Pybind11 ---
-find_package(Python 3.10 COMPONENTS Interpreter Development REQUIRED)
-find_package(pybind11 REQUIRED)
-
-# --- mimalloc (Re-enabled with proper configuration) ---
-set(MI_BUILD_TESTS OFF CACHE BOOL "Disable mimalloc tests")
-set(MI_BUILD_SHARED OFF CACHE BOOL "Build mimalloc as a static library")
-set(MI_BUILD_STATIC ON CACHE BOOL "Build mimalloc as a static library")
-set(MI_OVERRIDE ON CACHE BOOL "override system malloc")
-set(MI_MALLOC_OVERRIDE ON CACHE BOOL "override malloc globally")
-# For ASan to work correctly with mimalloc, we need to ensure mimalloc itself is also compiled with ASan.
-# CMake will propagate flags like CMAKE_C_FLAGS and CMAKE_CXX_FLAGS to subdirectories.
-add_subdirectory(mimalloc)
-
-# --- Create Python Module Target ---
-pybind11_add_module(flash_join SHARED hash_join.cpp)
-
-# --- Link Libraries and Set Include Directories ---
-target_include_directories(flash_join PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/mimalloc/include)
-target_link_libraries(flash_join PRIVATE 
-    mimalloc-static
-    pthread
-    pybind11::module
-    Python::Module
+project(
+    flash_join
+    VERSION 0.2.0
+    DESCRIPTION "CedarDB-style unchained hash join"
+    LANGUAGES CXX
 )
 
-# --- Compiler Flags ---
-target_compile_features(flash_join PRIVATE cxx_std_17)
+option(FLASH_JOIN_NATIVE_ARCH "Tune the extension for the build machine" ON)
+option(FLASH_JOIN_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
-# We check the build type. If it's a "Release" build (or empty), we use performance flags.
-# Otherwise, we set up for debugging with ASan.
-if (NOT CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "Release")
-    message(STATUS "Configuring for Release build")
-    if (MSVC)
-        target_compile_options(flash_join PRIVATE /O2 /arch:AVX2)
-    else()
-        target_compile_options(flash_join PRIVATE -O3 -march=native -fvisibility=hidden)
+find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+find_package(pybind11 CONFIG REQUIRED)
+
+pybind11_add_module(flash_join MODULE src/python_module.cpp)
+target_compile_features(flash_join PRIVATE cxx_std_17)
+target_include_directories(flash_join PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
+if(MSVC)
+    target_compile_options(flash_join PRIVATE /W4 /permissive-)
+    if(FLASH_JOIN_WARNINGS_AS_ERRORS)
+        target_compile_options(flash_join PRIVATE /WX)
     endif()
 else()
-    message(STATUS "Configuring for Debug/ASan build")
-    if (MSVC)
-        # MSVC's ASan support is different. This example focuses on GCC/Clang.
-        message(WARNING "AddressSanitizer is not configured for MSVC in this script.")
-        target_compile_options(flash_join PRIVATE /Zi /Ob0) # Basic debug flags for MSVC
-    else()
-        # --- Flags for GCC/Clang with ASan and Debug Info ---
-        message(STATUS "Enabling AddressSanitizer and debug flags.")
-        # General debug flags
-        target_compile_options(flash_join PRIVATE
-            -g                 # Generate debug information
-            -O1                # Use a low optimization level (-O0 can sometimes be too slow)
-            -Wall              # Enable all warnings
-            -Wextra            # Enable extra warnings
-            -fno-omit-frame-pointer # Needed for reliable stack traces
-            -march=native
-        )
-        # ASan specific flags for both compiler and linker
-        # target_compile_options(flash_join PRIVATE -fsanitize=address)
-        # target_link_options(flash_join PRIVATE -fsanitize=address)
+    target_compile_options(flash_join PRIVATE -Wall -Wextra -Wpedantic)
+    if(FLASH_JOIN_WARNINGS_AS_ERRORS)
+        target_compile_options(flash_join PRIVATE -Werror)
+    endif()
+
+    # The CedarDB hash uses hardware CRC32C. A portable fallback remains
+    # available, while release builds enable the native instruction set.
+    if(FLASH_JOIN_NATIVE_ARCH)
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+            target_compile_options(flash_join PRIVATE -msse4.2)
+        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" AND NOT APPLE)
+            target_compile_options(flash_join PRIVATE -march=armv8-a+crc)
+        endif()
     endif()
 endif()
+
+set_target_properties(flash_join PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
+
+install(TARGETS flash_join LIBRARY DESTINATION . RUNTIME DESTINATION .)

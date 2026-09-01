@@ -1,4 +1,13 @@
-*.parquet
-build
 *.csv
+*.dylib
+*.parquet
+*.pyd
 *.so
+.DS_Store
+.pytest_cache/
+.venv/
+artifacts/
+build/
+data/
+dist/
+wheelhouse/
