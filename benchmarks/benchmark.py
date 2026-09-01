@@ -109,7 +109,7 @@ def db_benchmark_cases(size: int, seed: int) -> Iterable[JoinCase]:
             # id5 is the string encoding of id2 in the original CSV. Encoding
             # it back to uint64 yields the same equality distribution.
             yield JoinCase(
-                f"{size_label}-Q4", build_keys, build_values, probe_keys
+                f"{size_label}-Q4-encoded", build_keys, build_values, probe_keys
             )
 
 
@@ -157,7 +157,7 @@ def discover_h2o_cases(data_dir: Path) -> list[JoinCase]:
         definitions = [
             ("Q1", "small", "id1"),
             ("Q2", "medium", "id2"),
-            ("Q4", "medium", "id5"),
+            ("Q4-encoded", "medium", "id5"),
             ("Q5", "big", "id3"),
         ]
         for query, build_name, key in definitions:

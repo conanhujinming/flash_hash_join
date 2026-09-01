@@ -1,4 +1,5 @@
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -10,8 +11,22 @@ def u64(values):
     return np.asarray(values, dtype=np.uint64)
 
 
-def test_reports_unchained_implementation():
-    assert flash_join.implementation == "cedardb_unchained"
+def test_reports_adaptive_implementation():
+    assert flash_join.implementation == "adaptive_perfect_or_cedardb_unchained"
+
+
+def test_dense_unique_build_uses_identical_join_semantics():
+    build_keys = u64([12, 10, 14, 11])
+    build_values = u64([120, 100, 140, 110])
+    probe_keys = u64([9, 10, 12, 13, 14, 15, 10])
+
+    count, _ = flash_join.join_count(build_keys, build_values, probe_keys)
+    keys, values, _ = flash_join.join_pairs(build_keys, build_values, probe_keys)
+
+    assert count == 4
+    assert Counter(zip(keys.tolist(), values.tolist())) == Counter(
+        [(10, 100), (12, 120), (14, 140), (10, 100)]
+    )
 
 
 def test_count_preserves_multimap_semantics():
@@ -97,3 +112,26 @@ def test_rejects_shape_and_length_mismatches():
             np.asarray([[10, 20]], dtype=np.uint64),
             u64([1]),
         )
+
+
+def test_persistent_worker_pool_supports_concurrent_joins():
+    build_keys = np.arange(1024, dtype=np.uint64)
+    build_values = build_keys * 10
+    probe_keys = np.arange(200_000, dtype=np.uint64) % 2048
+    expected = int(np.count_nonzero(probe_keys < 1024))
+
+    flash_join.set_num_threads(4)
+    try:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(
+                executor.map(
+                    lambda _: flash_join.join_count(
+                        build_keys, build_values, probe_keys
+                    )[0],
+                    range(8),
+                )
+            )
+    finally:
+        flash_join.set_num_threads(0)
+
+    assert results == [expected] * 8

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "flash_join/hash.hpp"
+#include "flash_join/join_types.hpp"
 #include "flash_join/parallel.hpp"
 
 #include <algorithm>
@@ -14,11 +15,6 @@
 #include <vector>
 
 namespace flash_join {
-
-struct BuildTuple {
-    std::uint64_t key;
-    std::uint64_t value;
-};
 
 // CedarDB's unchained join table. When Bloom filtering is enabled, each 64-bit
 // directory entry packs the end offset of a dense collision range into its

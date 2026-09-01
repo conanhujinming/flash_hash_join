@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 project(
     flash_join
     VERSION 0.2.0
-    DESCRIPTION "CedarDB-style unchained hash join"
+    DESCRIPTION "Adaptive perfect and CedarDB-style unchained joins"
     LANGUAGES CXX
 )
 

@@ -1,4 +1,5 @@
 #include "flash_join/parallel.hpp"
+#include "flash_join/perfect_hash_table.hpp"
 #include "flash_join/unchained_hash_table.hpp"
 
 #include <pybind11/numpy.h>
@@ -6,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -45,7 +47,10 @@ struct OutputTuple {
 };
 
 struct MaterializedJoin {
-    std::vector<OutputTuple> tuples;
+    std::vector<std::vector<OutputTuple>> chunks;
+    std::unique_ptr<std::uint64_t[]> contiguous_keys;
+    std::unique_ptr<std::uint64_t[]> contiguous_values;
+    std::size_t row_count;
     double seconds;
 };
 
@@ -85,13 +90,11 @@ Inputs validate_inputs(
     };
 }
 
-template <bool UseBloomFilter>
-JoinMetrics run_count(const Inputs& input) {
-    const auto start = std::chrono::steady_clock::now();
-    const auto threads = thread_count();
-    const UnchainedHashTable<UseBloomFilter> table(
-        input.build_keys, input.build_values, input.build_size, threads);
-
+template <typename Table>
+std::vector<PaddedCount> probe_count_chunks(
+    const Inputs& input,
+    const Table& table,
+    std::size_t threads) {
     const auto probe_threads = parallel::effective_thread_count(
         threads, input.probe_size, kProbeGrain);
     std::vector<PaddedCount> counts(probe_threads);
@@ -105,23 +108,42 @@ JoinMetrics run_count(const Inputs& input) {
             }
             counts[thread].value = local_count;
         });
+    return counts;
+}
 
+template <typename Table>
+std::size_t probe_count(const Inputs& input, const Table& table, std::size_t threads) {
+    const auto counts = probe_count_chunks(input, table, threads);
     std::size_t total = 0;
     for (const auto& count : counts) {
         total += count.value;
+    }
+    return total;
+}
+
+template <bool UseBloomFilter>
+JoinMetrics run_count(const Inputs& input) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto threads = thread_count();
+    std::size_t total = 0;
+    if (auto perfect = PerfectHashTable::try_build(
+            input.build_keys, input.build_values, input.build_size)) {
+        total = probe_count(input, *perfect, threads);
+    } else {
+        const UnchainedHashTable<UseBloomFilter> table(
+            input.build_keys, input.build_values, input.build_size, threads);
+        total = probe_count(input, table, threads);
     }
     const auto seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
     return JoinMetrics{total, seconds};
 }
 
-template <bool UseBloomFilter>
-MaterializedJoin run_materialize(const Inputs& input) {
-    const auto start = std::chrono::steady_clock::now();
-    const auto threads = thread_count();
-    const UnchainedHashTable<UseBloomFilter> table(
-        input.build_keys, input.build_values, input.build_size, threads);
-
+template <typename Table>
+std::vector<std::vector<OutputTuple>> probe_materialize(
+    const Inputs& input,
+    const Table& table,
+    std::size_t threads) {
     const auto probe_threads = parallel::effective_thread_count(
         threads, input.probe_size, kProbeGrain);
     std::vector<std::vector<OutputTuple>> local_results(probe_threads);
@@ -138,22 +160,69 @@ MaterializedJoin run_materialize(const Inputs& input) {
                 });
             }
         });
+    return local_results;
+}
 
-    std::vector<std::size_t> offsets(probe_threads + 1, 0);
-    for (std::size_t thread = 0; thread < probe_threads; ++thread) {
-        offsets[thread + 1] = offsets[thread] + local_results[thread].size();
+MaterializedJoin probe_perfect_materialize(
+    const Inputs& input,
+    const PerfectHashTable& table,
+    std::size_t threads,
+    std::chrono::steady_clock::time_point start) {
+    const auto counts = probe_count_chunks(input, table, threads);
+    std::vector<std::size_t> offsets(counts.size() + 1, 0);
+    for (std::size_t thread = 0; thread < counts.size(); ++thread) {
+        offsets[thread + 1] = offsets[thread] + counts[thread].value;
     }
 
-    std::vector<OutputTuple> output(offsets.back());
-    parallel::for_tasks(probe_threads, probe_threads, [&](std::size_t thread) {
-        std::copy(
-            local_results[thread].begin(),
-            local_results[thread].end(),
-            output.begin() + static_cast<std::ptrdiff_t>(offsets[thread]));
-    });
+    const auto row_count = offsets.back();
+    auto output_keys = std::unique_ptr<std::uint64_t[]>(
+        new std::uint64_t[row_count]);
+    auto output_values = std::unique_ptr<std::uint64_t[]>(
+        new std::uint64_t[row_count]);
+    const auto probe_threads = counts.size();
+    parallel::for_chunks(
+        input.probe_size,
+        probe_threads,
+        [&](std::size_t thread, std::size_t begin, std::size_t end) {
+            auto output_index = offsets[thread];
+            for (auto index = begin; index < end; ++index) {
+                const auto key = input.probe_keys[index];
+                table.find(key, [&](const BuildTuple& build) {
+                    output_keys[output_index] = key;
+                    output_values[output_index] = build.value;
+                    ++output_index;
+                });
+            }
+            assert(output_index == offsets[thread + 1]);
+        });
+
     const auto seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
-    return MaterializedJoin{std::move(output), seconds};
+    return MaterializedJoin{
+        {}, std::move(output_keys), std::move(output_values), row_count, seconds};
+}
+
+template <bool UseBloomFilter>
+MaterializedJoin run_materialize(const Inputs& input) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto threads = thread_count();
+    if (auto perfect = PerfectHashTable::try_build(
+            input.build_keys, input.build_values, input.build_size)) {
+        return probe_perfect_materialize(input, *perfect, threads, start);
+    }
+    const UnchainedHashTable<UseBloomFilter> table(
+        input.build_keys, input.build_values, input.build_size, threads);
+    auto chunks = probe_materialize(input, table, threads);
+
+    const auto row_count = std::accumulate(
+        chunks.begin(),
+        chunks.end(),
+        std::size_t{0},
+        [](std::size_t count, const auto& chunk) { return count + chunk.size(); });
+    const auto seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    return MaterializedJoin{
+        std::move(chunks), nullptr, nullptr, row_count, seconds};
 }
 
 template <bool UseBloomFilter>
@@ -181,7 +250,7 @@ py::tuple join_materialize(
         py::gil_scoped_release release;
         result = run_materialize<UseBloomFilter>(input);
     }
-    return py::make_tuple(py::int_(result.tuples.size()), result.seconds);
+    return py::make_tuple(py::int_(result.row_count), result.seconds);
 }
 
 template <bool UseBloomFilter>
@@ -196,14 +265,51 @@ py::tuple join_pairs(
         result = run_materialize<UseBloomFilter>(input);
     }
 
-    py::array_t<std::uint64_t> keys(result.tuples.size());
-    py::array_t<std::uint64_t> values(result.tuples.size());
+    const auto export_start = std::chrono::steady_clock::now();
+    py::array_t<std::uint64_t> keys(result.row_count);
+    py::array_t<std::uint64_t> values(result.row_count);
     auto* output_keys = keys.mutable_data();
     auto* output_values = values.mutable_data();
-    for (std::size_t index = 0; index < result.tuples.size(); ++index) {
-        output_keys[index] = result.tuples[index].key;
-        output_values[index] = result.tuples[index].value;
+
+    {
+        py::gil_scoped_release release;
+        if (result.contiguous_keys) {
+            const auto copy_threads = parallel::effective_thread_count(
+                thread_count(), result.row_count, kProbeGrain);
+            parallel::for_chunks(
+                result.row_count,
+                copy_threads,
+                [&](std::size_t, std::size_t begin, std::size_t end) {
+                    const auto count = end - begin;
+                    std::memcpy(
+                        output_keys + begin,
+                        result.contiguous_keys.get() + begin,
+                        count * sizeof(std::uint64_t));
+                    std::memcpy(
+                        output_values + begin,
+                        result.contiguous_values.get() + begin,
+                        count * sizeof(std::uint64_t));
+                });
+        } else {
+            std::vector<std::size_t> offsets(result.chunks.size() + 1, 0);
+            for (std::size_t chunk = 0; chunk < result.chunks.size(); ++chunk) {
+                offsets[chunk + 1] = offsets[chunk] + result.chunks[chunk].size();
+            }
+            parallel::for_tasks(
+                result.chunks.size(),
+                thread_count(),
+                [&](std::size_t chunk) {
+                    auto output_index = offsets[chunk];
+                    for (const auto& tuple : result.chunks[chunk]) {
+                        output_keys[output_index] = tuple.key;
+                        output_values[output_index] = tuple.value;
+                        ++output_index;
+                    }
+                });
+        }
     }
+    result.seconds += std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - export_start).count();
     return py::make_tuple(std::move(keys), std::move(values), result.seconds);
 }
 
@@ -213,8 +319,8 @@ py::tuple join_pairs(
 PYBIND11_MODULE(flash_join, module) {
     using namespace flash_join;
 
-    module.doc() = "Parallel CedarDB-style unchained hash joins for uint64 NumPy arrays.";
-    module.attr("implementation") = "cedardb_unchained";
+    module.doc() = "Adaptive perfect or CedarDB-style unchained joins for uint64 NumPy arrays.";
+    module.attr("implementation") = "adaptive_perfect_or_cedardb_unchained";
 
     module.def(
         "join_count",

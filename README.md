@@ -1,9 +1,11 @@
 # Flash Join
 
-Flash Join is a parallel `uint64` hash join for NumPy. Version 0.2 replaces the
-old linear-probing table with the **unchained** join table described in
+Flash Join is a parallel `uint64` join engine for NumPy. Its general-purpose
+fallback is the **unchained** join table described in
 CedarDB's [Simple, Efficient, and Robust Hash Tables for Join Processing](https://cedardb.com/blog/simple_efficient_hash_tables/)
 and its linked [DaMoN '24 paper](https://db.in.tum.de/~birler/papers/hashtable.pdf).
+An adaptive dispatcher uses a direct-address perfect table for unique, dense
+integer build domains and otherwise leaves the CedarDB implementation unchanged.
 
 The project intentionally exposes a small engine rather than claiming to be a
 general database replacement. `benchmarks/benchmark.py` compares the join core
@@ -28,11 +30,16 @@ reporting timings.
 Unlike the previous implementation, duplicate build keys are never discarded:
 the table has the multimap semantics required by relational joins.
 
+The perfect-table specialization is attempted only when the build range spans
+at most 1,048,576 and needs no more than four slots per build row. Duplicate
+keys immediately fall back to the unchained table. This targets dense dimension
+keys without increasing the resident memory of sparse joins.
+
 ## Repository layout
 
 ```text
 flash_hash_join/
-├── include/flash_join/        # Hashing, parallel helpers, unchained table
+├── include/flash_join/        # Hashing, worker pool, perfect and unchained tables
 ├── src/                       # Python extension bindings and join operators
 ├── tests/                     # Correctness and Bloom-policy equivalence tests
 ├── benchmarks/                # Synthetic and H2O/DuckDB benchmarks
@@ -78,7 +85,7 @@ count, core_seconds = flash_join.join_count(
     build_keys, build_values, probe_keys
 )
 
-# Materializes internally, matching the DuckDB materialization benchmark.
+# Materializes into per-worker chunks, matching a chunked database pipeline.
 count, core_seconds = flash_join.join(
     build_keys, build_values, probe_keys
 )
@@ -94,10 +101,11 @@ count, core_seconds = flash_join.join_count_no_bloom(
 )
 ```
 
-The API deliberately does not preserve the old combinatorial `adaptive_*`,
-`*_bloom`, or `*_radix` aliases. The only variants are the default CedarDB Bloom
-layout and the explicit `*_no_bloom` experiment. Build-side partitioning remains
-an internal parallel-build stage rather than a separate join algorithm.
+Dense-domain routing is automatic. The only
+explicit variants are the default CedarDB Bloom layout and the `*_no_bloom`
+experiment used when the unchained fallback is selected. Build-side
+partitioning remains an internal parallel-build stage rather than a separate
+join algorithm. Parallel phases reuse a persistent native worker pool.
 
 ## Benchmark
 
@@ -122,14 +130,15 @@ Run the original db-benchmark join key distributions directly in memory:
 ```bash
 python benchmarks/benchmark.py \
   --db-benchmark-size 10000000 \
-  --threads 8 \
+  --threads 6 \
   --repeats 11
 ```
 
 This is a NumPy port of `db-benchmark/_data/join-datagen.R`: it retains the 90%
 common, 10% side-only domains and `sample_all` multiplicities, while generating
-only the columns consumed by this uint64 join. Q4 dictionary-encodes the original
-`id5` string representation back to its `id2` equality domain.
+only the columns consumed by this uint64 join. `Q4-encoded` dictionary-encodes
+the original `id5` string representation back to its `id2` equality domain; it
+is deliberately not presented as a native string-join measurement.
 
 Alternatively, if R and data.table are installed, generate and read the original
 CSV files:
@@ -143,6 +152,41 @@ python benchmarks/benchmark.py --data-dir data --threads 8 --repeats 5
 For both engines, ingestion happens before timing. The benchmark records the
 median join time, checks identical row counts, and writes the raw CSV to
 `artifacts/benchmark.csv`.
+
+### Reference result
+
+The following result was measured on an Apple M5 Pro with a Release build,
+six worker threads, DuckDB 1.4.5, NumPy's db-benchmark port at size 10,000,000,
+and seed 108. Each cell is the median of three complete benchmark runs; each
+complete run itself reports the median of 11 measurements. Lower is better.
+
+![Flash Join versus DuckDB db-benchmark results](benchmarks/results/db_benchmark_10m_m5_pro.svg)
+
+| Case | Task | Flash Join Bloom | Flash Join no Bloom | DuckDB | No-Bloom speedup |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Q1 | count | 0.692 ms | **0.684 ms** | 5.787 ms | **8.46x** |
+| Q1 | materialize | 3.156 ms | **3.136 ms** | 12.850 ms | **4.10x** |
+| Q2 | count | **0.687 ms** | 0.710 ms | 2.626 ms | **3.70x** |
+| Q2 | materialize | **3.144 ms** | 3.170 ms | 11.293 ms | **3.56x** |
+| Q4-encoded | count | **0.686 ms** | 0.699 ms | 2.610 ms | **3.74x** |
+| Q4-encoded | materialize | **3.139 ms** | 3.292 ms | 11.171 ms | **3.39x** |
+| Q5 | count | 50.369 ms | **48.908 ms** | 73.112 ms | **1.49x** |
+| Q5 | materialize | 71.964 ms | **68.855 ms** | 76.402 ms | **1.11x** |
+
+The speedup column is `DuckDB / Flash Join no Bloom`. Q1, Q2, and Q4 use the
+adaptive perfect-table path, so their Bloom and no-Bloom labels converge to the
+same implementation; their small differences are measurement noise. Q5 uses
+the CedarDB-style unchained fallback and shows the intended Bloom-policy
+comparison. Materialization produces the same two `uint64` columns for both
+engines; input ingestion remains excluded.
+
+The source numbers are committed as
+`benchmarks/results/db_benchmark_10m_m5_pro.csv`. Regenerate the SVG after
+editing or replacing them with:
+
+```bash
+python benchmarks/plot_results.py
+```
 
 ## License
 
